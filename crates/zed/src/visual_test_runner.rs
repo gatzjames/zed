@@ -2504,6 +2504,20 @@ fn run_agent_tree_visual_test(
         cx.run_until_parked();
     }
 
+    root.update(cx, |thread, cx| {
+        thread.handle_session_update(
+            agent_client_protocol::schema::v1::SessionUpdate::AgentMessageChunk(
+                agent_client_protocol::schema::v1::ContentChunk::new(
+                    "While they run, here's what I found so far.\n\n"
+                        .repeat(40)
+                        .into(),
+                ),
+            ),
+            cx,
+        )
+    })?;
+    cx.run_until_parked();
+
     let explore = announce(&root, "explore", "Explore auth call sites", running(), cx)?;
     link("task-explore", "explore", cx);
     explore.update(cx, |thread, cx| {
@@ -2676,6 +2690,25 @@ fn run_agent_tree_visual_test(
         update_baseline,
     )?;
 
+    cx.update_window(workspace_window.into(), |_, window, cx| {
+        conversation_view.update(cx, |view, cx| {
+            view.navigate_to_thread(root.read(cx).session_id().clone(), window, cx);
+            if let Some(active) = view.active_thread() {
+                active.read(cx).list_state.scroll_to(gpui::ListOffset {
+                    item_ix: 5,
+                    offset_in_item: px(200.0),
+                });
+            }
+        });
+    })?;
+    cx.run_until_parked();
+    let sticky_prompt_result = run_visual_test(
+        "agent_tree_sticky_prompt",
+        workspace_window.into(),
+        cx,
+        update_baseline,
+    )?;
+
     cx.update_window(workspace_window.into(), |_, window, _cx| {
         window.remove_window();
     })
@@ -2686,12 +2719,17 @@ fn run_agent_tree_visual_test(
         cx.run_until_parked();
     }
 
-    Ok([permission_result, questions_result, breadcrumb_result]
-        .into_iter()
-        .fold(TestResult::Passed, |result, next| match next {
-            TestResult::Passed => result,
-            updated @ TestResult::BaselineUpdated(_) => updated,
-        }))
+    Ok([
+        permission_result,
+        questions_result,
+        breadcrumb_result,
+        sticky_prompt_result,
+    ]
+    .into_iter()
+    .fold(TestResult::Passed, |result, next| match next {
+        TestResult::Passed => result,
+        updated @ TestResult::BaselineUpdated(_) => updated,
+    }))
 }
 
 /// Visual test for the Tool Permissions Settings UI page

@@ -7855,6 +7855,112 @@ pub(crate) mod tests {
         assert_eq!(cancelled, ["child", "grandchild"]);
     }
 
+    fn push_long_reply(thread: &Entity<AcpThread>, cx: &mut VisualTestContext) {
+        thread.update(cx, |thread, cx| {
+            thread
+                .handle_session_update(
+                    acp_v1::SessionUpdate::AgentMessageChunk(acp_v1::ContentChunk::new(
+                        "A long reply\n\n".repeat(80).into(),
+                    )),
+                    cx,
+                )
+                .expect("assistant reply");
+        });
+        cx.run_until_parked();
+    }
+
+    fn scroll_thread_to(
+        thread_view: &Entity<ThreadView>,
+        item_ix: usize,
+        cx: &mut VisualTestContext,
+    ) {
+        thread_view.update(cx, |view, cx| {
+            view.list_state.scroll_to(ListOffset {
+                item_ix,
+                offset_in_item: px(40.0),
+            });
+            cx.notify();
+        });
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    async fn test_sticky_prompt_follows_the_turn_in_view(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::default_response(), cx).await;
+        add_to_workspace_with_size(conversation_view.clone(), true, cx);
+        let thread_view = active_thread(&conversation_view, cx);
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+        for prompt in ["First prompt", "Second prompt"] {
+            thread.update(cx, |thread, cx| {
+                thread.push_user_content_block(None, prompt.into(), cx);
+            });
+            cx.run_until_parked();
+            push_long_reply(&thread, cx);
+        }
+
+        scroll_thread_to(&thread_view, 0, cx);
+        assert!(
+            cx.debug_bounds("sticky-prompt-0").is_none(),
+            "no header while the prompt itself is at the top"
+        );
+        scroll_thread_to(&thread_view, 1, cx);
+        assert!(cx.debug_bounds("sticky-prompt-0").is_some());
+        scroll_thread_to(&thread_view, 3, cx);
+        assert!(cx.debug_bounds("sticky-prompt-0").is_none());
+        let header = cx
+            .debug_bounds("sticky-prompt-2")
+            .expect("the header follows the turn in view");
+
+        cx.simulate_click(header.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        thread_view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.list_state.logical_scroll_top().item_ix,
+                2,
+                "clicking the header jumps to its prompt"
+            );
+        });
+        assert!(cx.debug_bounds("sticky-prompt-2").is_none());
+    }
+
+    #[gpui::test]
+    async fn test_sticky_prompt_shows_a_subagents_task(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::default_response(), cx).await;
+        add_to_workspace_with_size(conversation_view.clone(), true, cx);
+        let root =
+            active_thread(&conversation_view, cx).read_with(cx, |view, _| view.thread.clone());
+        let root_session_id = root.read_with(cx, |thread, _| thread.session_id().clone());
+        let child = announce_test_subagent(&root, "child", "Write tests", running_state(), cx);
+        child
+            .update(cx, |child, cx| {
+                child.upsert_session_message(
+                    acp_v2::SessionMessage::new("task-1")
+                        .sender_session_id(root_session_id)
+                        .content(vec![acp_v2::ContentBlock::from("Write the session tests")]),
+                    cx,
+                )
+            })
+            .expect("task message");
+        cx.run_until_parked();
+        push_long_reply(&child, cx);
+        conversation_view.update_in(cx, |view, window, cx| {
+            view.navigate_to_thread(acp_v2::SessionId::new("child"), window, cx);
+        });
+        cx.run_until_parked();
+
+        let child_view = active_thread(&conversation_view, cx);
+        scroll_thread_to(&child_view, 1, cx);
+        assert!(cx.debug_bounds("sticky-prompt-0").is_some());
+        assert!(
+            cx.debug_bounds("sticky-prompt-task").is_some(),
+            "a subagent's header shows the task it was given"
+        );
+    }
+
     #[gpui::test]
     async fn test_concurrent_subagent_loads_create_one_thread_view(cx: &mut TestAppContext) {
         init_test(cx);

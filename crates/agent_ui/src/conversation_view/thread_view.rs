@@ -8535,6 +8535,117 @@ impl ThreadView {
         self.scroll_to_end(cx);
     }
 
+    /// The prompt that the topmost visible entry answers, pinned while the
+    /// prompt itself is scrolled out of view. In a subagent, that's the task
+    /// its parent gave it.
+    fn render_sticky_prompt(&self, cx: &Context<Self>) -> Option<AnyElement> {
+        let thread = self.thread.read(cx);
+        let entries = thread.entries();
+        let top_ix = self
+            .list_state
+            .logical_scroll_top()
+            .item_ix
+            .min(entries.len().checked_sub(1)?);
+        let is_prompt =
+            |ix: &usize| matches!(entries.get(*ix), Some(AgentThreadEntry::UserMessage(_)));
+        let prompt_ix = (0..=top_ix).rev().find(is_prompt)?;
+        if prompt_ix == top_ix {
+            return None;
+        }
+        let Some(AgentThreadEntry::UserMessage(message)) = entries.get(prompt_ix) else {
+            return None;
+        };
+        let markdown = message.content.to_markdown(cx);
+        let first_line = markdown
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty())?
+            .to_string();
+        let is_task = message.sender_session_id.is_some();
+        let label = match &message.sender_session_id {
+            Some(sender) => format!("Task from {}: {first_line}", self.session_label(sender, cx)),
+            None => first_line,
+        };
+        let previous_ix = (0..prompt_ix).rev().find(is_prompt);
+        let next_ix = (top_ix + 1..entries.len()).find(is_prompt);
+        let max_content_width = AgentSettings::get_global(cx).max_content_width;
+        let scroll_to = |entry_ix: usize| {
+            cx.listener(move |this, _, _, cx| {
+                cx.stop_propagation();
+                this.list_state.scroll_to(ListOffset {
+                    item_ix: entry_ix,
+                    offset_in_item: px(0.0),
+                });
+                cx.notify();
+            })
+        };
+
+        Some(
+            h_flex()
+                .absolute()
+                .top_0()
+                .left_0()
+                .right_0()
+                .justify_center()
+                .bg(cx.theme().colors().panel_background)
+                .border_b_1()
+                .border_color(cx.theme().colors().border)
+                .child(
+                    h_flex()
+                        .id("sticky-prompt")
+                        .debug_selector(move || format!("sticky-prompt-{prompt_ix}"))
+                        .when_some(max_content_width, |this, max_width| this.max_w(max_width))
+                        .w_full()
+                        .min_w_0()
+                        .py_1()
+                        .px_3()
+                        .gap_1p5()
+                        .cursor_pointer()
+                        .hover(|style| style.bg(cx.theme().colors().element_hover))
+                        .child(
+                            Icon::new(IconName::Person)
+                                .size(IconSize::XSmall)
+                                .color(Color::Muted),
+                        )
+                        .child(
+                            h_flex()
+                                .flex_1()
+                                .min_w_0()
+                                .when(is_task, |this| {
+                                    this.debug_selector(|| "sticky-prompt-task".to_string())
+                                })
+                                .child(
+                                    Label::new(label)
+                                        .size(LabelSize::Small)
+                                        .color(Color::Muted)
+                                        .truncate(),
+                                ),
+                        )
+                        .child(
+                            IconButton::new("sticky-prompt-previous", IconName::ArrowUp)
+                                .icon_size(IconSize::XSmall)
+                                .tooltip(Tooltip::text("Previous Prompt"))
+                                .disabled(previous_ix.is_none())
+                                .when_some(previous_ix, |this, entry_ix| {
+                                    this.on_click(scroll_to(entry_ix))
+                                }),
+                        )
+                        .child(
+                            IconButton::new("sticky-prompt-next", IconName::ArrowDown)
+                                .icon_size(IconSize::XSmall)
+                                .tooltip(Tooltip::text("Next Prompt"))
+                                .disabled(next_ix.is_none())
+                                .when_some(next_ix, |this, entry_ix| {
+                                    this.on_click(scroll_to(entry_ix))
+                                }),
+                        )
+                        .tooltip(Tooltip::text("Jump to Prompt"))
+                        .on_click(scroll_to(prompt_ix)),
+                )
+                .into_any_element(),
+        )
+    }
+
     fn scroll_output_to_previous_message(
         &mut self,
         _: &ScrollOutputToPreviousMessage,
@@ -13960,8 +14071,10 @@ impl Render for ThreadView {
                 if has_messages {
                     this.flex_1()
                         .size_full()
+                        .relative()
                         .child(self.render_entries(cx))
                         .vertical_scrollbar_for(&list_state, window, cx)
+                        .children(self.render_sticky_prompt(cx))
                         .into_any()
                 } else {
                     this.into_any()
