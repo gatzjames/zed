@@ -175,6 +175,53 @@ impl ElicitationFormState {
         self.snapshot(cx).validate(schema)
     }
 
+    fn field_has_value(&self, field_name: &str, cx: &App) -> bool {
+        match self.fields.get(field_name) {
+            Some(ElicitationFieldState::Text(editor)) => {
+                !editor.read(cx).text(cx).trim().is_empty()
+            }
+            Some(ElicitationFieldState::Boolean(_)) => true,
+            Some(ElicitationFieldState::SingleSelect { value }) => value.is_some(),
+            Some(ElicitationFieldState::MultiSelect(values)) => !values.is_empty(),
+            None => false,
+        }
+    }
+
+    pub(crate) fn is_answered(&self, field_names: &[String], cx: &App) -> bool {
+        field_names
+            .iter()
+            .any(|field_name| self.field_has_value(field_name, cx))
+    }
+
+    pub(crate) fn has_errors(&self, field_names: &[String]) -> bool {
+        field_names
+            .iter()
+            .any(|field_name| self.field_errors.contains_key(field_name))
+    }
+
+    /// A one-line summary of the answers given in these fields.
+    pub(crate) fn answer_summary(&self, field_names: &[String], cx: &App) -> Option<String> {
+        let answers = field_names
+            .iter()
+            .filter_map(|field_name| match self.fields.get(field_name)? {
+                ElicitationFieldState::Text(editor) => {
+                    Some(editor.read(cx).text(cx).trim().to_string())
+                        .filter(|text| !text.is_empty())
+                }
+                ElicitationFieldState::Boolean(value) => {
+                    Some(if *value { "Yes" } else { "No" }.to_string())
+                }
+                ElicitationFieldState::SingleSelect { value } => value.clone(),
+                ElicitationFieldState::MultiSelect(values) => {
+                    let mut values = values.iter().cloned().collect::<Vec<_>>();
+                    values.sort();
+                    Some(values.join(", ")).filter(|values| !values.is_empty())
+                }
+            })
+            .collect::<Vec<_>>();
+        (!answers.is_empty()).then(|| answers.join(" · "))
+    }
+
     pub(crate) fn set_errors(&mut self, errors: HashMap<String, SharedString>) {
         self.field_errors = errors;
         self.is_submitting = false;
@@ -488,6 +535,227 @@ mod tests {
             });
             cx.run_until_parked();
         }
+    }
+
+    fn question_schema(questions: &[(&str, &str, bool)]) -> acp::ElicitationSchema {
+        let mut schema = acp::ElicitationSchema::new();
+        for (index, (header, question, multi_select)) in questions.iter().enumerate() {
+            let options = vec![
+                acp::EnumOption::new("first", "First"),
+                acp::EnumOption::new("second", "Second"),
+            ];
+            let field_name = format!("question_{index}");
+            schema = if *multi_select {
+                schema.property(
+                    field_name.clone(),
+                    acp::MultiSelectPropertySchema::titled(options)
+                        .title(*header)
+                        .description(*question),
+                    false,
+                )
+            } else {
+                schema.property(
+                    field_name.clone(),
+                    acp::StringPropertySchema::new()
+                        .one_of(options)
+                        .title(*header)
+                        .description(*question),
+                    false,
+                )
+            };
+            schema = schema.property(
+                format!("{field_name}_custom"),
+                acp::StringPropertySchema::new().title("Other"),
+                false,
+            );
+        }
+        schema
+    }
+
+    fn form_elicitation(id: &str, message: &str, schema: acp::ElicitationSchema) -> Elicitation {
+        Elicitation {
+            id: ElicitationEntryId(id.into()),
+            request: acp::CreateElicitationRequest::new(
+                acp::ElicitationFormMode::new(preview_request_scope(0), schema),
+                message,
+            ),
+            status: pending_status(),
+        }
+    }
+
+    #[test]
+    fn question_tabs_split_question_lists_and_keep_other_forms_whole() {
+        let questions = form_elicitation(
+            "questions",
+            "Please answer the following questions.",
+            question_schema(&[
+                ("Auth", "Which auth?", false),
+                ("Storage", "Which storage?", true),
+            ]),
+        );
+        let lone_question = form_elicitation(
+            "lone",
+            "Which backend?",
+            acp::ElicitationSchema::new().property(
+                "question_0",
+                acp::StringPropertySchema::new()
+                    .one_of(vec![acp::EnumOption::new("sqlite", "SQLite")])
+                    .title("Backend"),
+                false,
+            ),
+        );
+        let mixed_form = form_elicitation(
+            "mixed",
+            "Configure the server",
+            acp::ElicitationSchema::new().string("name", true).property(
+                "region",
+                acp::StringPropertySchema::new().one_of(vec![acp::EnumOption::new("eu", "Europe")]),
+                true,
+            ),
+        );
+
+        let tabs = question_tabs(&[&questions, &lone_question, &mixed_form]);
+        assert_eq!(
+            tabs,
+            vec![
+                QuestionTab {
+                    question_ix: 0,
+                    field_names: vec!["question_0".into(), "question_0_custom".into()],
+                    label: "Auth".into(),
+                    prompt: None,
+                },
+                QuestionTab {
+                    question_ix: 0,
+                    field_names: vec!["question_1".into(), "question_1_custom".into()],
+                    label: "Storage".into(),
+                    prompt: None,
+                },
+                QuestionTab {
+                    question_ix: 1,
+                    field_names: vec!["question_0".into()],
+                    label: "Backend".into(),
+                    prompt: Some("Which backend?".into()),
+                },
+                QuestionTab {
+                    question_ix: 2,
+                    field_names: vec!["name".into(), "region".into()],
+                    label: "Configure the server".into(),
+                    prompt: Some("Configure the server".into()),
+                },
+            ]
+        );
+    }
+
+    struct TestQuestionsView {
+        questions: Vec<(Elicitation, ElicitationFormState)>,
+        selected_tab: usize,
+        events: Rc<RefCell<Vec<String>>>,
+    }
+
+    impl Render for TestQuestionsView {
+        fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let events = self.events.clone();
+            let record = move |event: String| events.borrow_mut().push(event);
+            let field_handlers = {
+                let mut handlers = ElicitationCardHandlers::noop();
+                let record = record.clone();
+                handlers.on_single_select_change =
+                    Rc::new(move |_, name, value, _| record(format!("{name}: {value}")));
+                handlers
+            };
+            let respond = |response: &'static str| -> QuestionsHandler {
+                let record = record.clone();
+                Rc::new(move |_, _| record(response.to_string()))
+            };
+            let handlers = QuestionsCardHandlers {
+                on_select_tab: {
+                    let record = record.clone();
+                    Rc::new(move |tab, _| record(format!("tab: {tab}")))
+                },
+                on_submit_all: respond("submit"),
+                on_decline_all: respond("decline"),
+                on_cancel_all: respond("cancel"),
+            };
+            div().size_full().child(
+                QuestionsCard::new(
+                    self.questions
+                        .iter()
+                        .enumerate()
+                        .map(|(entry_ix, (elicitation, form_state))| QuestionForm {
+                            entry_ix,
+                            elicitation,
+                            form_state: Some(form_state),
+                        })
+                        .collect(),
+                    "Claude Code".into(),
+                    self.selected_tab,
+                    field_handlers,
+                    handlers,
+                )
+                .render(cx),
+            )
+        }
+    }
+
+    #[gpui::test]
+    fn questions_card_shows_one_question_per_tab(cx: &mut TestAppContext) {
+        init_keyboard_test(cx);
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let schema = question_schema(&[
+                ("Auth", "Which auth?", false),
+                ("Storage", "Which storage?", false),
+            ]);
+            TestQuestionsView {
+                questions: vec![(
+                    form_elicitation("questions", "Please answer.", schema.clone()),
+                    ElicitationFormState::new(&schema, window, cx),
+                )],
+                selected_tab: 0,
+                events: Rc::default(),
+            }
+        });
+        let events = view.read_with(cx, |view, _| view.events.clone());
+        cx.run_until_parked();
+        for tab in ["question-tab-0", "question-tab-1", "question-tab-2"] {
+            assert!(cx.debug_bounds(tab).is_some(), "missing {tab}");
+        }
+        assert!(cx.debug_bounds("questions-summary").is_none());
+
+        cx.update(|window, cx| window.focus_next(cx));
+        press_keys(cx, "2");
+        assert_eq!(
+            *events.borrow(),
+            ["question_0: second", "tab: 1"],
+            "picking an option by number moves on to the next question"
+        );
+        events.borrow_mut().clear();
+        press_keys(cx, "right");
+        assert_eq!(*events.borrow(), ["tab: 1"]);
+
+        view.update(cx, |view, cx| {
+            view.selected_tab = 2;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("questions-summary").is_some());
+    }
+
+    #[gpui::test]
+    fn questions_card_without_several_questions_has_no_tabs(cx: &mut TestAppContext) {
+        init_keyboard_test(cx);
+        let (_view, cx) = cx.add_window_view(|window, cx| {
+            let schema = question_schema(&[("Auth", "Which auth?", false)]);
+            TestQuestionsView {
+                questions: vec![(
+                    form_elicitation("question", "Which auth?", schema.clone()),
+                    ElicitationFormState::new(&schema, window, cx),
+                )],
+                selected_tab: 0,
+                events: Rc::default(),
+            }
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("question-tab-0").is_none());
     }
 
     #[gpui::test]
@@ -1805,6 +2073,17 @@ impl ElicitationCardHandlers {
         }
     }
 
+    /// Runs `followup` after each single-select choice, such as moving on to
+    /// the next question.
+    pub(crate) fn after_single_select(mut self, followup: impl Fn(&mut App) + 'static) -> Self {
+        let on_single_select_change = self.on_single_select_change.clone();
+        self.on_single_select_change = Rc::new(move |elicitation_id, field_name, value, cx| {
+            on_single_select_change(elicitation_id, field_name, value, cx);
+            followup(cx);
+        });
+        self
+    }
+
     pub(crate) fn noop() -> Self {
         Self::new(
             |_, _, _| {},
@@ -2021,6 +2300,29 @@ impl<'a> ElicitationCard<'a> {
                     ))
                 },
             ))
+            .into_any_element()
+    }
+
+    fn render_fields(&self, field_names: &[String], cx: &App) -> AnyElement {
+        let acp::ElicitationMode::Form(mode) = &self.elicitation.request.mode else {
+            return Empty.into_any_element();
+        };
+        let Some(state) = self.form_state else {
+            return Empty.into_any_element();
+        };
+        v_flex()
+            .gap_2()
+            .children(field_names.iter().filter_map(|field_name| {
+                let property = mode.requested_schema.properties.get(field_name)?;
+                let field = state.fields.get(field_name)?;
+                Some(self.render_field(
+                    field_name,
+                    property,
+                    field,
+                    state.field_errors.get(field_name),
+                    cx,
+                ))
+            }))
             .into_any_element()
     }
 
@@ -2407,5 +2709,435 @@ impl<'a> ElicitationCard<'a> {
                 )
             })
             .into_any_element()
+    }
+}
+
+/// The key suffix of the free-text answer that accompanies a select question,
+/// as in Claude Code's `AskUserQuestion` forms.
+const CUSTOM_ANSWER_SUFFIX: &str = "_custom";
+
+/// One page of a tabbed questions card.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct QuestionTab {
+    /// The index of the question's elicitation within the card.
+    pub question_ix: usize,
+    pub field_names: Vec<String>,
+    pub label: SharedString,
+    /// Shown above the fields when they don't describe the question themselves.
+    pub prompt: Option<SharedString>,
+}
+
+fn is_select_property(property: &acp::ElicitationPropertySchema) -> bool {
+    match property {
+        acp::ElicitationPropertySchema::String(schema) => !single_select_options(schema).is_empty(),
+        acp::ElicitationPropertySchema::Array(_) => true,
+        _ => false,
+    }
+}
+
+/// Splits pending form questions into tabs. A form made only of select
+/// questions, each optionally followed by its free-text answer, gets a tab per
+/// question; any other form keeps all of its fields on one tab.
+pub(crate) fn question_tabs(questions: &[&Elicitation]) -> Vec<QuestionTab> {
+    let mut tabs = Vec::new();
+    for (question_ix, elicitation) in questions.iter().enumerate() {
+        let acp::ElicitationMode::Form(mode) = &elicitation.request.mode else {
+            continue;
+        };
+        let properties = &mode.requested_schema.properties;
+        let message = SharedString::from(elicitation.request.message.clone());
+        let selects = properties
+            .iter()
+            .filter(|(_, property)| is_select_property(property))
+            .map(|(field_name, _)| field_name.clone())
+            .collect::<Vec<_>>();
+        let is_question_list = !selects.is_empty()
+            && properties.iter().all(|(field_name, property)| {
+                is_select_property(property)
+                    || field_name
+                        .strip_suffix(CUSTOM_ANSWER_SUFFIX)
+                        .is_some_and(|question| selects.iter().any(|select| select == question))
+            });
+        if !is_question_list {
+            tabs.push(QuestionTab {
+                question_ix,
+                field_names: properties.keys().cloned().collect(),
+                label: mode
+                    .requested_schema
+                    .title
+                    .clone()
+                    .map(SharedString::from)
+                    .unwrap_or_else(|| message.clone()),
+                prompt: Some(message),
+            });
+            continue;
+        }
+        for field_name in selects {
+            let custom_answer = format!("{field_name}{CUSTOM_ANSWER_SUFFIX}");
+            let has_description = properties
+                .get(&field_name)
+                .and_then(property_description)
+                .is_some();
+            let label = properties
+                .get(&field_name)
+                .map(|property| property_title(&field_name, property))
+                .unwrap_or_else(|| field_name.clone().into());
+            let mut field_names = vec![field_name];
+            if properties.contains_key(&custom_answer) {
+                field_names.push(custom_answer);
+            }
+            tabs.push(QuestionTab {
+                question_ix,
+                field_names,
+                label,
+                // A lone question carries its text in the message instead.
+                prompt: (!has_description).then(|| message.clone()),
+            });
+        }
+    }
+    tabs
+}
+
+pub(crate) struct QuestionForm<'a> {
+    pub entry_ix: usize,
+    pub elicitation: &'a Elicitation,
+    pub form_state: Option<&'a ElicitationFormState>,
+}
+
+type QuestionsHandler = Rc<dyn Fn(&mut Window, &mut App)>;
+
+#[derive(Clone)]
+pub(crate) struct QuestionsCardHandlers {
+    pub on_select_tab: Rc<dyn Fn(usize, &mut App)>,
+    pub on_submit_all: QuestionsHandler,
+    pub on_decline_all: QuestionsHandler,
+    pub on_cancel_all: QuestionsHandler,
+}
+
+/// The questions an agent is waiting on, one tab per question, ending with a
+/// tab that summarizes the answers and submits them together.
+pub(crate) struct QuestionsCard<'a> {
+    questions: Vec<QuestionForm<'a>>,
+    requester_name: SharedString,
+    selected_tab: usize,
+    field_handlers: ElicitationCardHandlers,
+    handlers: QuestionsCardHandlers,
+}
+
+impl<'a> QuestionsCard<'a> {
+    pub(crate) fn new(
+        questions: Vec<QuestionForm<'a>>,
+        requester_name: SharedString,
+        selected_tab: usize,
+        field_handlers: ElicitationCardHandlers,
+        handlers: QuestionsCardHandlers,
+    ) -> Self {
+        Self {
+            questions,
+            requester_name,
+            selected_tab,
+            field_handlers,
+            handlers,
+        }
+    }
+
+    pub(crate) fn render(self, cx: &App) -> AnyElement {
+        let elicitations = self
+            .questions
+            .iter()
+            .map(|question| question.elicitation)
+            .collect::<Vec<_>>();
+        let tabs = question_tabs(&elicitations);
+        if tabs.len() <= 1 {
+            let Some(question) = self.questions.into_iter().next() else {
+                return Empty.into_any_element();
+            };
+            return ElicitationCard::new(
+                question.entry_ix,
+                question.elicitation,
+                self.requester_name,
+                question.form_state,
+                self.field_handlers,
+            )
+            .render(cx)
+            .into_any_element();
+        }
+
+        let submit_tab = tabs.len();
+        let selected_tab = self.selected_tab.min(submit_tab);
+        let border_color = cx.theme().colors().border.opacity(0.8);
+        let body = match tabs.get(selected_tab) {
+            Some(tab) => self.render_question(tab, selected_tab, cx),
+            None => self.render_summary(&tabs, cx),
+        };
+
+        v_flex()
+            .key_context("Elicitation")
+            .tab_group()
+            .on_action(|_: &menu::SelectNext, window, cx| window.focus_next(cx))
+            .on_action(|_: &menu::SelectPrevious, window, cx| window.focus_prev(cx))
+            .on_key_down(self.key_down_handler(&tabs, selected_tab))
+            .mx_5()
+            .my_1p5()
+            .rounded_md()
+            .border_1()
+            .border_color(border_color)
+            .overflow_hidden()
+            .child(self.render_tab_strip(&tabs, selected_tab, cx))
+            .child(body)
+            .child(self.render_footer(selected_tab, submit_tab, cx))
+            .into_any_element()
+    }
+
+    fn render_tab_strip(&self, tabs: &[QuestionTab], selected_tab: usize, cx: &App) -> AnyElement {
+        let submit_tab = tabs.len();
+        let tab_button = |id: usize, label: SharedString, icon: Option<(IconName, Color)>| {
+            let on_select_tab = self.handlers.on_select_tab.clone();
+            div()
+                .debug_selector(move || format!("question-tab-{id}"))
+                .child(
+                    Button::new(("question-tab", id), label)
+                        .label_size(LabelSize::Small)
+                        .toggle_state(id == selected_tab)
+                        .when_some(icon, |button, (icon, color)| {
+                            button.start_icon(Icon::new(icon).size(IconSize::XSmall).color(color))
+                        })
+                        .on_click(move |_, _, cx| on_select_tab(id, cx)),
+                )
+        };
+
+        h_flex()
+            .id("question-tabs")
+            .w_full()
+            .p_1()
+            .gap_0p5()
+            .overflow_x_scroll()
+            .border_b_1()
+            .border_color(cx.theme().colors().border.opacity(0.8))
+            .bg(cx
+                .theme()
+                .colors()
+                .element_background
+                .blend(cx.theme().colors().editor_foreground.opacity(0.025)))
+            .children(tabs.iter().enumerate().map(|(ix, tab)| {
+                let form_state = self.questions[tab.question_ix].form_state;
+                let icon = if form_state.is_some_and(|state| state.has_errors(&tab.field_names)) {
+                    Some((IconName::Warning, Color::Error))
+                } else if form_state.is_some_and(|state| state.is_answered(&tab.field_names, cx)) {
+                    Some((IconName::Check, Color::Success))
+                } else {
+                    None
+                };
+                tab_button(ix, tab.label.clone(), icon)
+            }))
+            .child(tab_button(submit_tab, "Submit".into(), None))
+            .into_any_element()
+    }
+
+    fn render_question(&self, tab: &QuestionTab, selected_tab: usize, cx: &App) -> AnyElement {
+        let question = &self.questions[tab.question_ix];
+        let on_select_tab = self.handlers.on_select_tab.clone();
+        let field_handlers = self
+            .field_handlers
+            .clone()
+            .after_single_select(move |cx| on_select_tab(selected_tab + 1, cx));
+        let card = ElicitationCard::new(
+            question.entry_ix,
+            question.elicitation,
+            self.requester_name.clone(),
+            question.form_state,
+            field_handlers,
+        );
+        v_flex()
+            .p_3()
+            .gap_2()
+            .when_some(tab.prompt.clone(), |this, prompt| {
+                this.child(Label::new(prompt).size(LabelSize::Small))
+            })
+            .child(card.render_fields(&tab.field_names, cx))
+            .into_any_element()
+    }
+
+    fn render_summary(&self, tabs: &[QuestionTab], cx: &App) -> AnyElement {
+        v_flex()
+            .debug_selector(|| "questions-summary".to_string())
+            .p_3()
+            .gap_1()
+            .children(tabs.iter().map(|tab| {
+                let answer = self.questions[tab.question_ix]
+                    .form_state
+                    .and_then(|state| state.answer_summary(&tab.field_names, cx));
+                let is_answered = answer.is_some();
+                h_flex()
+                    .gap_2()
+                    .child(
+                        Label::new(tab.label.clone())
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .child(
+                        Label::new(answer.unwrap_or_else(|| "Skipped".into()))
+                            .size(LabelSize::Small)
+                            .color(if is_answered {
+                                Color::Default
+                            } else {
+                                Color::Muted
+                            })
+                            .truncate(),
+                    )
+            }))
+            .into_any_element()
+    }
+
+    fn render_footer(&self, selected_tab: usize, submit_tab: usize, cx: &App) -> AnyElement {
+        let is_submitting = self
+            .questions
+            .iter()
+            .any(|question| question.form_state.is_some_and(|state| state.is_submitting));
+        let footer = h_flex()
+            .w_full()
+            .p_1()
+            .gap_1()
+            .justify_end()
+            .border_t_1()
+            .border_color(cx.theme().colors().border.opacity(0.8));
+        if selected_tab < submit_tab {
+            let on_back = self.handlers.on_select_tab.clone();
+            let on_next = self.handlers.on_select_tab.clone();
+            return footer
+                .child(
+                    Button::new("question-back", "Back")
+                        .label_size(LabelSize::Small)
+                        .disabled(selected_tab == 0)
+                        .on_click(move |_, _, cx| on_back(selected_tab.saturating_sub(1), cx)),
+                )
+                .child(
+                    Button::new("question-next", "Next")
+                        .label_size(LabelSize::Small)
+                        .on_click(move |_, _, cx| on_next(selected_tab + 1, cx)),
+                )
+                .into_any_element();
+        }
+        let on_submit_all = self.handlers.on_submit_all.clone();
+        let on_decline_all = self.handlers.on_decline_all.clone();
+        let on_cancel_all = self.handlers.on_cancel_all.clone();
+        footer
+            .child(
+                Button::new("questions-submit", "Submit")
+                    .tab_index(0_isize)
+                    .start_icon(
+                        Icon::new(IconName::Check)
+                            .size(IconSize::XSmall)
+                            .color(Color::Success),
+                    )
+                    .label_size(LabelSize::Small)
+                    .disabled(is_submitting)
+                    .on_click(move |_, window, cx| on_submit_all(window, cx)),
+            )
+            .child(
+                Button::new("questions-decline", "Decline")
+                    .tab_index(0_isize)
+                    .start_icon(
+                        Icon::new(IconName::Close)
+                            .size(IconSize::XSmall)
+                            .color(Color::Error),
+                    )
+                    .label_size(LabelSize::Small)
+                    .on_click(move |_, window, cx| on_decline_all(window, cx)),
+            )
+            .child(
+                Button::new("questions-cancel", "Cancel")
+                    .tab_index(0_isize)
+                    .label_size(LabelSize::Small)
+                    .on_click(move |_, window, cx| on_cancel_all(window, cx)),
+            )
+            .into_any_element()
+    }
+
+    /// ←/→ switch questions and 1–9 pick an option, unless a text field has
+    /// focus and needs those keys itself.
+    fn key_down_handler(
+        &self,
+        tabs: &[QuestionTab],
+        selected_tab: usize,
+    ) -> impl Fn(&gpui::KeyDownEvent, &mut Window, &mut App) + 'static {
+        let submit_tab = tabs.len();
+        let tab = tabs.get(selected_tab);
+        let question = tab.map(|tab| &self.questions[tab.question_ix]);
+        let text_fields = tab
+            .zip(question.and_then(|question| question.form_state))
+            .map(|(tab, state)| {
+                tab.field_names
+                    .iter()
+                    .filter_map(|field_name| match state.fields.get(field_name) {
+                        Some(ElicitationFieldState::Text(editor)) => Some(editor.clone()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let single_select = tab.zip(question).and_then(|(tab, question)| {
+            let acp::ElicitationMode::Form(mode) = &question.elicitation.request.mode else {
+                return None;
+            };
+            let field_name = tab.field_names.first()?;
+            let acp::ElicitationPropertySchema::String(schema) =
+                mode.requested_schema.properties.get(field_name)?
+            else {
+                return None;
+            };
+            let values = single_select_options(schema)
+                .into_iter()
+                .map(|option| option.value)
+                .collect::<Vec<_>>();
+            (!values.is_empty())
+                .then(|| (question.elicitation.id.clone(), field_name.clone(), values))
+        });
+        let on_select_tab = self.handlers.on_select_tab.clone();
+        let on_single_select_change = self.field_handlers.on_single_select_change.clone();
+
+        move |event, window, cx| {
+            if text_fields
+                .iter()
+                .any(|editor| editor.focus_handle(cx).is_focused(window))
+            {
+                return;
+            }
+            let keystroke = &event.keystroke;
+            if keystroke.modifiers.modified() {
+                return;
+            }
+            match keystroke.key.as_str() {
+                "left" if selected_tab > 0 => {
+                    on_select_tab(selected_tab - 1, cx);
+                    cx.stop_propagation();
+                }
+                "right" if selected_tab < submit_tab => {
+                    on_select_tab(selected_tab + 1, cx);
+                    cx.stop_propagation();
+                }
+                key => {
+                    let Some((elicitation_id, field_name, values)) = &single_select else {
+                        return;
+                    };
+                    let Some(value) = key
+                        .parse::<usize>()
+                        .ok()
+                        .and_then(|number| number.checked_sub(1))
+                        .and_then(|index| values.get(index))
+                    else {
+                        return;
+                    };
+                    on_single_select_change(
+                        elicitation_id.clone(),
+                        field_name.clone(),
+                        value.clone(),
+                        cx,
+                    );
+                    on_select_tab(selected_tab + 1, cx);
+                    cx.stop_propagation();
+                }
+            }
+        }
     }
 }

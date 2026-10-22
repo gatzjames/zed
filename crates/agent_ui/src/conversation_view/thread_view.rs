@@ -53,7 +53,10 @@ use url::Url;
 use util::markdown::source_position_from_fragment;
 use workspace::{OpenOptions, SERIALIZATION_THROTTLE_TIME};
 
-use super::elicitation::{ElicitationCard, ElicitationCardHandlers, should_render_elicitation};
+use super::elicitation::{
+    ElicitationCard, ElicitationCardHandlers, QuestionForm, QuestionsCard, QuestionsCardHandlers,
+    should_render_elicitation,
+};
 use super::*;
 
 const DATA_RETENTION_LEARN_MORE_URL: &str = "https://support.claude.com/en/articles/15425996-data-retention-practices-for-mythos-class-models";
@@ -4179,11 +4182,14 @@ impl ThreadView {
                     .thread_view(request.session_id())
             })
             .flatten();
-        let body = match &request_view {
-            Some(request_view) => request_view
+        let body = match (&focused.id, &request_view) {
+            (InboxItemId::Questions(session_id), _) => {
+                self.render_inbox_questions(session_id, &focused, cx)
+            }
+            (_, Some(request_view)) => request_view
                 .read(cx)
                 .render_inbox_request(&request, window, cx),
-            None => self.render_inbox_request(&request, window, cx),
+            (_, None) => self.render_inbox_request(&request, window, cx),
         }?;
         let item_count = items.len();
         let list_expanded = self.inbox_list_expanded && item_count > 1;
@@ -4332,6 +4338,85 @@ impl ThreadView {
                         .into_any_element(),
                 )
             }
+        }
+    }
+
+    fn render_inbox_questions(
+        &self,
+        session_id: &acp_v2::SessionId,
+        item: &InboxItem,
+        cx: &Context<Self>,
+    ) -> Option<AnyElement> {
+        let conversation = self.conversation.read(cx);
+        let thread = conversation.threads.get(session_id)?.read(cx);
+        let questions = item
+            .members
+            .iter()
+            .filter_map(|request| match request {
+                UserRequestRef::Elicitation { elicitation_id, .. } => {
+                    let (entry_ix, elicitation) = thread.elicitation(elicitation_id)?;
+                    Some(QuestionForm {
+                        entry_ix,
+                        elicitation,
+                        form_state: conversation.elicitation_draft(session_id, elicitation_id),
+                    })
+                }
+                UserRequestRef::Permission { .. } => None,
+            })
+            .collect::<Vec<_>>();
+        if questions.is_empty() {
+            return None;
+        }
+        Some(
+            QuestionsCard::new(
+                questions,
+                self.agent_display_name.clone(),
+                conversation.selected_question_tab(session_id, cx),
+                self.elicitation_card_handlers(session_id.clone()),
+                self.questions_card_handlers(session_id.clone()),
+            )
+            .render(cx),
+        )
+    }
+
+    fn questions_card_handlers(&self, session_id: acp_v2::SessionId) -> QuestionsCardHandlers {
+        let conversation = self.conversation.downgrade();
+        let respond_all = |action: acp_v2::ElicitationAction| -> Rc<dyn Fn(&mut Window, &mut App)> {
+            let conversation = conversation.clone();
+            let session_id = session_id.clone();
+            Rc::new(move |_, cx| {
+                conversation
+                    .update(cx, |conversation, cx| {
+                        conversation.respond_to_questions(&session_id, action.clone(), cx);
+                    })
+                    .log_err();
+            })
+        };
+        QuestionsCardHandlers {
+            on_select_tab: Rc::new({
+                let conversation = conversation.clone();
+                let session_id = session_id.clone();
+                move |tab, cx| {
+                    conversation
+                        .update(cx, |conversation, cx| {
+                            conversation.select_question_tab(&session_id, tab, cx);
+                        })
+                        .log_err();
+                }
+            }),
+            on_submit_all: Rc::new({
+                let conversation = conversation.clone();
+                let session_id = session_id.clone();
+                move |_, cx| {
+                    conversation
+                        .update(cx, |conversation, cx| {
+                            conversation.submit_questions(&session_id, cx);
+                        })
+                        .log_err();
+                }
+            }),
+            on_decline_all: respond_all(acp_v2::ElicitationAction::Decline),
+            on_cancel_all: respond_all(acp_v2::ElicitationAction::Cancel),
         }
     }
 

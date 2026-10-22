@@ -45,7 +45,8 @@ use parking_lot::{Mutex, RwLock};
 use project::{AgentId, AgentServerStore, Project, ProjectEntryId, ProjectPath};
 
 use crate::conversation_view::elicitation::{
-    ElicitationCard, ElicitationCardHandlers, ElicitationFormState, should_render_elicitation,
+    ElicitationCard, ElicitationCardHandlers, ElicitationFormState, QuestionTab, question_tabs,
+    should_render_elicitation,
 };
 use crate::conversation_view::user_requests::{
     InboxItem, InboxItemId, RequestGrouping, UserRequestQueue, UserRequestRef,
@@ -296,6 +297,15 @@ impl ProfileProvider for Entity<agent::Thread> {
     }
 }
 
+#[derive(Clone, Debug, PartialEq)]
+enum SelectedQuestionTab {
+    Question {
+        elicitation_id: ElicitationEntryId,
+        field_name: String,
+    },
+    Summary,
+}
+
 /// After the focused request is resolved, the next one is shown but ignores
 /// input briefly, so a repeated click or shortcut can't answer it unread.
 const INBOX_INPUT_GUARD: Duration = Duration::from_millis(300);
@@ -314,6 +324,9 @@ pub(crate) struct Conversation {
     /// Sandbox prompts whose "surprising Unicode" warning the user has
     /// acknowledged, wherever the prompt was shown.
     acknowledged_confusable_warnings: HashSet<acp_v2::ToolCallId>,
+    /// The tab shown in each agent's questions card. Kept by identity because
+    /// answering a question removes its tabs and shifts the others.
+    selected_question_tabs: HashMap<acp_v2::SessionId, SelectedQuestionTab>,
     subscriptions: Vec<Subscription>,
     updated_at: Option<Instant>,
 }
@@ -384,6 +397,13 @@ impl Conversation {
                             },
                             cx,
                         );
+                        if this
+                            .requests
+                            .members(&InboxItemId::Questions(session_id.clone()))
+                            .is_empty()
+                        {
+                            this.selected_question_tabs.remove(&session_id);
+                        }
                         cx.notify();
                     }
                     AcpThreadEvent::NewEntry
@@ -869,6 +889,7 @@ impl Conversation {
                                 if let Some(draft) = this.elicitation_drafts.get_mut(&key) {
                                     draft.set_errors(errors);
                                 }
+                                this.select_first_question_with_error(&session_id, cx);
                                 cx.notify();
                             }
                         }
@@ -888,6 +909,120 @@ impl Conversation {
                 );
             }
             _ => {}
+        }
+    }
+
+    /// The pending questions shown together in an agent's questions card.
+    fn pending_questions(
+        &self,
+        session_id: &acp_v2::SessionId,
+        cx: &App,
+    ) -> Vec<ElicitationEntryId> {
+        self.requests
+            .members(&InboxItemId::Questions(session_id.clone()))
+            .into_iter()
+            .filter(|request| self.request_is_pending(request, cx))
+            .filter_map(|request| match request {
+                UserRequestRef::Elicitation { elicitation_id, .. } => Some(elicitation_id),
+                UserRequestRef::Permission { .. } => None,
+            })
+            .collect()
+    }
+
+    /// The tabs of an agent's questions card, with the question each belongs to.
+    fn question_tabs(
+        &self,
+        session_id: &acp_v2::SessionId,
+        cx: &App,
+    ) -> Vec<(ElicitationEntryId, QuestionTab)> {
+        let question_ids = self.pending_questions(session_id, cx);
+        let Some(thread) = self.threads.get(session_id) else {
+            return Vec::new();
+        };
+        let thread = thread.read(cx);
+        let questions = question_ids
+            .iter()
+            .filter_map(|id| thread.elicitation(id).map(|(_, elicitation)| elicitation))
+            .collect::<Vec<_>>();
+        question_tabs(&questions)
+            .into_iter()
+            .map(|tab| (questions[tab.question_ix].id.clone(), tab))
+            .collect()
+    }
+
+    pub fn selected_question_tab(&self, session_id: &acp_v2::SessionId, cx: &App) -> usize {
+        let tabs = self.question_tabs(session_id, cx);
+        match self.selected_question_tabs.get(session_id) {
+            None => 0,
+            Some(SelectedQuestionTab::Summary) => tabs.len(),
+            Some(SelectedQuestionTab::Question {
+                elicitation_id,
+                field_name,
+            }) => tabs
+                .iter()
+                .position(|(id, tab)| {
+                    id == elicitation_id && tab.field_names.first() == Some(field_name)
+                })
+                .unwrap_or(0),
+        }
+    }
+
+    pub fn select_question_tab(
+        &mut self,
+        session_id: &acp_v2::SessionId,
+        tab: usize,
+        cx: &mut Context<Self>,
+    ) {
+        let selected = match self.question_tabs(session_id, cx).into_iter().nth(tab) {
+            Some((elicitation_id, tab)) => SelectedQuestionTab::Question {
+                elicitation_id,
+                field_name: tab.field_names.first().cloned().unwrap_or_default(),
+            },
+            None => SelectedQuestionTab::Summary,
+        };
+        self.selected_question_tabs
+            .insert(session_id.clone(), selected);
+        cx.notify();
+    }
+
+    fn select_first_question_with_error(
+        &mut self,
+        session_id: &acp_v2::SessionId,
+        cx: &mut Context<Self>,
+    ) {
+        let first_error =
+            self.question_tabs(session_id, cx)
+                .iter()
+                .position(|(elicitation_id, tab)| {
+                    self.elicitation_drafts
+                        .get(&(session_id.clone(), elicitation_id.clone()))
+                        .is_some_and(|draft| draft.has_errors(&tab.field_names))
+                });
+        if let Some(tab) = first_error {
+            self.select_question_tab(session_id, tab, cx);
+        }
+    }
+
+    /// Submits every pending question in the agent's card, one response each.
+    pub fn submit_questions(&mut self, session_id: &acp_v2::SessionId, cx: &mut Context<Self>) {
+        for elicitation_id in self.pending_questions(session_id, cx) {
+            self.submit_elicitation(session_id.clone(), elicitation_id, cx);
+        }
+    }
+
+    pub fn respond_to_questions(
+        &mut self,
+        session_id: &acp_v2::SessionId,
+        action: acp_v2::ElicitationAction,
+        cx: &mut Context<Self>,
+    ) {
+        for elicitation_id in self.pending_questions(session_id, cx) {
+            self.respond_to_elicitation(
+                session_id.clone(),
+                elicitation_id,
+                acp_v2::CreateElicitationResponse::new(action.clone()),
+                cx,
+            );
         }
     }
 
@@ -19768,6 +19903,97 @@ pub(crate) mod tests {
                 "answered questions drop their drafts"
             );
         });
+    }
+
+    #[gpui::test]
+    async fn test_questions_card_answers_each_question_and_keeps_failures(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::default_response(), cx).await;
+        add_to_workspace_with_size(conversation_view.clone(), true, cx);
+        let thread_view = active_thread(&conversation_view, cx);
+        let (thread, conversation) = thread_view.read_with(cx, |view, _| {
+            (view.thread.clone(), view.conversation.clone())
+        });
+        let session_id = thread.read_with(cx, |thread, _| thread.session_id().clone());
+        let ask = |schema: acp_v2::ElicitationSchema, message: &str, cx: &mut VisualTestContext| {
+            let session_id = session_id.clone();
+            let message = message.to_string();
+            thread.update(cx, |thread, cx| {
+                thread
+                    .request_elicitation(
+                        acp_v2::CreateElicitationRequest::new(
+                            acp_v2::ElicitationFormMode::new(
+                                acp_v2::ElicitationSessionScope::new(session_id),
+                                schema,
+                            ),
+                            message,
+                        ),
+                        cx,
+                    )
+                    .expect("elicitation request")
+            })
+        };
+        let choice = |header: &str| {
+            acp_v2::StringPropertySchema::new()
+                .one_of(vec![acp_v2::EnumOption::new("yes", "Yes")])
+                .title(header)
+                .description(format!("{header}?"))
+        };
+        let questions = ask(
+            acp_v2::ElicitationSchema::new()
+                .property("question_0", choice("Auth"), false)
+                .property("question_1", choice("Storage"), false),
+            "Please answer the following questions.",
+            cx,
+        );
+        let branch = ask(
+            acp_v2::ElicitationSchema::new().string("name", true),
+            "Name the branch",
+            cx,
+        );
+        cx.run_until_parked();
+        conversation.read_with(cx, |conversation, cx| {
+            let items = conversation.inbox_items(cx);
+            assert_eq!(items.len(), 1, "an agent's questions share one card");
+            assert_eq!(items[0].members.len(), 2);
+        });
+        for tab in [
+            "question-tab-0",
+            "question-tab-1",
+            "question-tab-2",
+            "question-tab-3",
+        ] {
+            assert!(cx.debug_bounds(tab).is_some(), "missing {tab}");
+        }
+
+        conversation.update(cx, |conversation, cx| {
+            conversation.select_question_tab(&session_id, 3, cx);
+            conversation.submit_questions(&session_id, cx);
+        });
+        cx.run_until_parked();
+        assert!(matches!(
+            questions.await.action,
+            acp_v2::ElicitationAction::Accept(_)
+        ));
+        conversation.read_with(cx, |conversation, cx| {
+            assert_eq!(conversation.inbox_items(cx).len(), 1);
+            assert_eq!(
+                conversation.selected_question_tab(&session_id, cx),
+                0,
+                "the question that failed validation is shown"
+            );
+        });
+
+        conversation.update(cx, |conversation, cx| {
+            conversation.respond_to_questions(&session_id, acp_v2::ElicitationAction::Decline, cx);
+        });
+        cx.run_until_parked();
+        assert!(matches!(
+            branch.await.action,
+            acp_v2::ElicitationAction::Decline
+        ));
+        assert!(cx.debug_bounds("inbox").is_none());
     }
 
     #[gpui::test]
