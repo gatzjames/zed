@@ -2865,24 +2865,18 @@ impl<'a> QuestionsCard<'a> {
 
         let submit_tab = tabs.len();
         let selected_tab = self.selected_tab.min(submit_tab);
-        let border_color = cx.theme().colors().border.opacity(0.8);
         let body = match tabs.get(selected_tab) {
             Some(tab) => self.render_question(tab, selected_tab, cx),
             None => self.render_summary(&tabs, cx),
         };
 
+        // The inbox frames the card, so it adds no border of its own.
         v_flex()
             .key_context("Elicitation")
             .tab_group()
             .on_action(|_: &menu::SelectNext, window, cx| window.focus_next(cx))
             .on_action(|_: &menu::SelectPrevious, window, cx| window.focus_prev(cx))
             .on_key_down(self.key_down_handler(&tabs, selected_tab))
-            .mx_5()
-            .my_1p5()
-            .rounded_md()
-            .border_1()
-            .border_color(border_color)
-            .overflow_hidden()
             .child(self.render_tab_strip(&tabs, selected_tab, cx))
             .child(body)
             .child(self.render_footer(selected_tab, submit_tab, cx))

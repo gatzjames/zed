@@ -6,7 +6,7 @@ use acp_thread::{
     ProtocolErrorInfo, RetryStatus, SelectedPermissionOutcome, ThreadStatus, ToolCall,
     ToolCallContent, ToolCallStatus,
 };
-use acp_thread::{AgentConnection, Plan};
+use acp_thread::{AgentConnection, AgentRunStatus, Plan};
 use action_log::{ActionLog, ActionLogTelemetry, DiffStats};
 use agent::{NativeAgentServer, NoModelConfiguredError, ThreadStore};
 use agent_client_protocol::schema::v2 as acp_v2;
@@ -310,9 +310,45 @@ enum SelectedQuestionTab {
 /// input briefly, so a repeated click or shortcut can't answer it unread.
 const INBOX_INPUT_GUARD: Duration = Duration::from_millis(300);
 
+/// One agent in a conversation's tree of agents, as the roster shows it.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct AgentNode {
+    pub session_id: acp_v2::SessionId,
+    pub depth: usize,
+    pub status: AgentRunStatus,
+    /// The most urgent status among this agent and the agents it spawned.
+    pub rollup: AgentRunStatus,
+    pub activity: Option<SharedString>,
+    pub elapsed: Option<Duration>,
+}
+
+fn status_urgency(status: AgentRunStatus) -> u8 {
+    match status {
+        AgentRunStatus::WaitingForUser => 4,
+        AgentRunStatus::Running | AgentRunStatus::Starting => 3,
+        AgentRunStatus::Failed => 2,
+        AgentRunStatus::Cancelled | AgentRunStatus::Unknown => 1,
+        AgentRunStatus::Done => 0,
+    }
+}
+
+fn more_urgent(left: AgentRunStatus, right: AgentRunStatus) -> AgentRunStatus {
+    if status_urgency(right) > status_urgency(left) {
+        right
+    } else {
+        left
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct Conversation {
     threads: HashMap<acp_v2::SessionId, Entity<AcpThread>>,
+    /// Sessions in the order they joined, which orders siblings in the tree.
+    thread_order: Vec<acp_v2::SessionId>,
+    /// When each agent was last seen working, to keep recently finished
+    /// agents in the roster until the user sends another message.
+    last_active_at: HashMap<acp_v2::SessionId, Instant>,
+    last_user_message_at: Option<Instant>,
     requests: UserRequestQueue,
     /// The session whose view is showing; requests from its subtree come first.
     viewer: Option<acp_v2::SessionId>,
@@ -356,6 +392,11 @@ impl Conversation {
             })
             .collect::<Vec<_>>();
         self.threads.insert(session_id.clone(), thread.clone());
+        if !self.thread_order.contains(&session_id) {
+            self.thread_order.push(session_id.clone());
+        }
+        self.last_active_at
+            .insert(session_id.clone(), cx.background_executor().now());
         for request_id in pending_permissions {
             self.enqueue_permission(&session_id, request_id, cx);
         }
@@ -365,7 +406,8 @@ impl Conversation {
 
         let subscription = cx.subscribe(&thread, {
             let session_id = session_id.clone();
-            move |this, _thread, event, cx| {
+            move |this, thread, event, cx| {
+                this.observe_agent_activity(&session_id, &thread, event, cx);
                 match event {
                     AcpThreadEvent::NoticesUpdated => return,
                     AcpThreadEvent::ToolAuthorizationRequested(id) => {
@@ -433,6 +475,225 @@ impl Conversation {
         });
         self.subscriptions.push(subscription);
         cx.notify();
+    }
+
+    fn observe_agent_activity(
+        &mut self,
+        session_id: &acp_v2::SessionId,
+        thread: &Entity<AcpThread>,
+        event: &AcpThreadEvent,
+        cx: &App,
+    ) {
+        let now = cx.background_executor().now();
+        let thread = thread.read(cx);
+        if matches!(event, AcpThreadEvent::NewEntry)
+            && thread.parent_session_id().is_none()
+            && matches!(
+                thread.entries().last(),
+                Some(AgentThreadEntry::UserMessage(message)) if message.sender_session_id.is_none()
+            )
+        {
+            self.last_user_message_at = Some(now);
+        }
+        if self.agent_status(session_id, cx).is_active() {
+            self.last_active_at.insert(session_id.clone(), now);
+        }
+    }
+
+    fn children_of<'a>(
+        &'a self,
+        session_id: &'a acp_v2::SessionId,
+        cx: &'a App,
+    ) -> impl Iterator<Item = &'a acp_v2::SessionId> {
+        self.thread_order.iter().filter(move |child_id| {
+            self.threads
+                .get(*child_id)
+                .and_then(|thread| thread.read(cx).parent_session_id())
+                == Some(session_id)
+        })
+    }
+
+    pub fn agent_status(&self, session_id: &acp_v2::SessionId, cx: &App) -> AgentRunStatus {
+        if self.requests.requests().any(|request| {
+            request.session_id() == session_id && self.request_is_pending(request, cx)
+        }) {
+            return AgentRunStatus::WaitingForUser;
+        }
+        let Some(thread) = self.threads.get(session_id) else {
+            return AgentRunStatus::Unknown;
+        };
+        let thread = thread.read(cx);
+        if thread.subagent_info().is_some() {
+            return thread.run_status();
+        }
+        let delegating_tool_call = thread
+            .parent_session_id()
+            .and_then(|parent_id| self.threads.get(parent_id))
+            .and_then(|parent| parent.read(cx).tool_call_for_subagent(session_id));
+        if let Some(tool_call) = delegating_tool_call {
+            return thread_view::subagent_run_status(tool_call, Some(thread), cx);
+        }
+        match thread.foreground_activity() {
+            ForegroundActivity::Unconfirmed => AgentRunStatus::Starting,
+            ForegroundActivity::Running => AgentRunStatus::Running,
+            ForegroundActivity::RequiresAction => AgentRunStatus::WaitingForUser,
+            ForegroundActivity::Idle if thread.had_error() => AgentRunStatus::Failed,
+            ForegroundActivity::Idle => AgentRunStatus::Done,
+        }
+    }
+
+    /// What the agent is doing, or how it ended.
+    pub fn agent_activity(&self, session_id: &acp_v2::SessionId, cx: &App) -> Option<SharedString> {
+        let thread = self.threads.get(session_id)?.read(cx);
+        match self.agent_status(session_id, cx) {
+            AgentRunStatus::WaitingForUser => Some("Waiting for you".into()),
+            AgentRunStatus::Starting | AgentRunStatus::Running => {
+                let current_tool = thread.entries().iter().rev().find_map(|entry| match entry {
+                    AgentThreadEntry::ToolCall(tool_call)
+                        if matches!(
+                            tool_call.status(),
+                            ToolCallStatus::Pending | ToolCallStatus::InProgress
+                        ) =>
+                    {
+                        let label = tool_call.label.read(cx).source().to_string();
+                        let first_line = label.lines().next().unwrap_or_default().to_string();
+                        Some(SharedString::from(first_line)).filter(|label| !label.is_empty())
+                    }
+                    _ => None,
+                });
+                Some(current_tool.unwrap_or_else(|| "Thinking…".into()))
+            }
+            AgentRunStatus::Done => {
+                let files_changed = thread.action_log().read(cx).changed_buffers(cx).count();
+                (files_changed > 0).then(|| {
+                    if files_changed == 1 {
+                        "1 file changed".into()
+                    } else {
+                        format!("{files_changed} files changed").into()
+                    }
+                })
+            }
+            AgentRunStatus::Failed => Some("Failed".into()),
+            AgentRunStatus::Cancelled => Some("Stopped".into()),
+            AgentRunStatus::Unknown => Some("Status unknown".into()),
+        }
+    }
+
+    fn is_retained_in_roster(
+        &self,
+        session_id: &acp_v2::SessionId,
+        status: AgentRunStatus,
+    ) -> bool {
+        status.is_active()
+            || self.last_user_message_at.is_none_or(|last_message| {
+                self.last_active_at
+                    .get(session_id)
+                    .is_some_and(|last_active| *last_active >= last_message)
+            })
+    }
+
+    /// The conversation's agents in tree order. Running and waiting agents
+    /// stay, as do those that worked since the user's last message.
+    pub fn agent_tree(&self, cx: &App) -> Vec<AgentNode> {
+        let mut nodes = Vec::new();
+        for session_id in &self.thread_order {
+            let is_root = self
+                .threads
+                .get(session_id)
+                .and_then(|thread| thread.read(cx).parent_session_id())
+                .is_none_or(|parent_id| !self.threads.contains_key(parent_id));
+            if is_root {
+                self.push_agent_nodes(session_id, 0, &mut nodes, cx);
+            }
+        }
+        nodes
+    }
+
+    fn push_agent_nodes(
+        &self,
+        session_id: &acp_v2::SessionId,
+        depth: usize,
+        nodes: &mut Vec<AgentNode>,
+        cx: &App,
+    ) -> Option<AgentRunStatus> {
+        let index = nodes.len();
+        let status = self.agent_status(session_id, cx);
+        nodes.push(AgentNode {
+            session_id: session_id.clone(),
+            depth,
+            status,
+            rollup: status,
+            activity: self.agent_activity(session_id, cx),
+            elapsed: self
+                .threads
+                .get(session_id)
+                .and_then(|thread| thread.read(cx).activity_duration()),
+        });
+        let mut rollup = status;
+        let mut has_children = false;
+        for child_id in self
+            .children_of(session_id, cx)
+            .cloned()
+            .collect::<Vec<_>>()
+        {
+            if let Some(child_rollup) = self.push_agent_nodes(&child_id, depth + 1, nodes, cx) {
+                rollup = more_urgent(rollup, child_rollup);
+                has_children = true;
+            }
+        }
+        if depth > 0 && !has_children && !self.is_retained_in_roster(session_id, status) {
+            nodes.truncate(index);
+            return None;
+        }
+        if let Some(node) = nodes.get_mut(index) {
+            node.rollup = rollup;
+        }
+        Some(rollup)
+    }
+
+    /// How many agents this one spawned, directly or not, and the most urgent
+    /// of their statuses.
+    pub fn descendant_summary(
+        &self,
+        session_id: &acp_v2::SessionId,
+        cx: &App,
+    ) -> (usize, Option<AgentRunStatus>) {
+        let mut count = 0;
+        let mut rollup = None;
+        let mut pending = self
+            .children_of(session_id, cx)
+            .cloned()
+            .collect::<Vec<_>>();
+        while let Some(child_id) = pending.pop() {
+            count += 1;
+            let status = self.agent_status(&child_id, cx);
+            rollup = Some(rollup.map_or(status, |rollup| more_urgent(rollup, status)));
+            pending.extend(self.children_of(&child_id, cx).cloned());
+        }
+        (count, rollup)
+    }
+
+    /// Stopping an agent stops everything it spawned. Native subagents stop
+    /// with their parent; agent-announced ones are cancelled one by one.
+    pub fn cancel_descendants(&self, session_id: &acp_v2::SessionId, cx: &mut App) {
+        let mut pending = self
+            .children_of(session_id, cx)
+            .cloned()
+            .collect::<Vec<_>>();
+        while let Some(child_id) = pending.pop() {
+            pending.extend(self.children_of(&child_id, cx).cloned());
+            let Some(thread) = self.threads.get(&child_id).cloned() else {
+                continue;
+            };
+            let can_cancel = thread.read(cx).subagent_info().is_some_and(|subagent| {
+                subagent.can_cancel && thread.read(cx).run_status().is_active()
+            });
+            if can_cancel {
+                thread
+                    .update(cx, |thread, cx| thread.cancel(cx))
+                    .detach_and_log_err(cx);
+            }
+        }
     }
 
     fn enqueue_permission(
@@ -7392,6 +7653,206 @@ pub(crate) mod tests {
             vec![root_session_id],
             "the client never closes agent-announced subagents"
         );
+    }
+
+    fn running_state() -> acp_v2::StateUpdate {
+        acp_v2::StateUpdate::Running(acp_v2::RunningStateUpdate::new())
+    }
+
+    fn announce_test_subagent(
+        parent: &Entity<AcpThread>,
+        session_id: &str,
+        title: &str,
+        state: acp_v2::StateUpdate,
+        cx: &mut VisualTestContext,
+    ) -> Entity<AcpThread> {
+        let child = parent.update(cx, |parent, cx| {
+            parent.spawn_reported_subagent(acp_v2::SessionId::new(session_id), cx)
+        });
+        child
+            .update(cx, |child, cx| {
+                child.apply_subagent_update(
+                    acp_v2::SubagentUpdate::new(session_id)
+                        .title(title)
+                        .capabilities(
+                            acp_v2::SubagentSessionCapabilities::new()
+                                .cancel(acp_v2::SessionCancelCapabilities::new()),
+                        )
+                        .state(state),
+                    cx,
+                )
+            })
+            .expect("subagent update");
+        cx.run_until_parked();
+        child
+    }
+
+    #[gpui::test]
+    async fn test_agent_tree_rolls_up_status_and_keeps_recent_agents(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::default_response(), cx).await;
+        let root_view = active_thread(&conversation_view, cx);
+        let (root, conversation) = root_view.read_with(cx, |view, _| {
+            (view.thread.clone(), view.conversation.clone())
+        });
+        let child = announce_test_subagent(&root, "child", "Write tests", running_state(), cx);
+        let grandchild =
+            announce_test_subagent(&child, "grandchild", "Fixtures", running_state(), cx);
+        announce_test_subagent(
+            &root,
+            "finished",
+            "Update docs",
+            acp_v2::StateUpdate::Idle(
+                acp_v2::IdleStateUpdate::new().stop_reason(acp_v2::StopReason::EndTurn),
+            ),
+            cx,
+        );
+        let tree = |cx: &mut VisualTestContext| {
+            conversation.read_with(cx, |conversation, cx| {
+                conversation
+                    .agent_tree(cx)
+                    .into_iter()
+                    .skip(1)
+                    .map(|node| {
+                        (
+                            node.session_id.0.to_string(),
+                            node.depth,
+                            node.status,
+                            node.rollup,
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+        };
+        assert_eq!(
+            tree(cx),
+            vec![
+                (
+                    "child".into(),
+                    1,
+                    AgentRunStatus::Running,
+                    AgentRunStatus::Running
+                ),
+                (
+                    "grandchild".into(),
+                    2,
+                    AgentRunStatus::Running,
+                    AgentRunStatus::Running
+                ),
+                (
+                    "finished".into(),
+                    1,
+                    AgentRunStatus::Done,
+                    AgentRunStatus::Done
+                ),
+            ]
+        );
+
+        let _permission = request_test_tool_authorization(&grandchild, "fixture-tool", "allow", cx);
+        cx.run_until_parked();
+        assert_eq!(
+            tree(cx)[..2],
+            [
+                (
+                    "child".into(),
+                    1,
+                    AgentRunStatus::Running,
+                    AgentRunStatus::WaitingForUser
+                ),
+                (
+                    "grandchild".into(),
+                    2,
+                    AgentRunStatus::WaitingForUser,
+                    AgentRunStatus::WaitingForUser
+                ),
+            ],
+            "a parent shows the most urgent status below it"
+        );
+
+        cx.executor().advance_clock(Duration::from_secs(1));
+        root.update(cx, |thread, cx| {
+            thread.push_user_content_block(None, "Next task".into(), cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            tree(cx)
+                .into_iter()
+                .map(|(session_id, ..)| session_id)
+                .collect::<Vec<_>>(),
+            vec!["child".to_string(), "grandchild".to_string()],
+            "agents that finished before the user's latest message leave the roster"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_roster_and_breadcrumb_navigate_between_agents(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::default_response(), cx).await;
+        add_to_workspace_with_size(conversation_view.clone(), true, cx);
+        let root_view = active_thread(&conversation_view, cx);
+        let root = root_view.read_with(cx, |view, _| view.thread.clone());
+        let root_session_id = root.read_with(cx, |thread, _| thread.session_id().clone());
+        assert!(
+            cx.debug_bounds("agent-roster").is_none(),
+            "the roster appears only once there are subagents"
+        );
+
+        let child = announce_test_subagent(&root, "child", "Write tests", running_state(), cx);
+        announce_test_subagent(&child, "grandchild", "Fixtures", running_state(), cx);
+        assert!(cx.debug_bounds("agent-roster").is_some());
+        assert!(cx.debug_bounds("agent-row-grandchild").is_none());
+        let summary = cx
+            .debug_bounds("agent-roster-summary")
+            .expect("roster summary");
+        cx.simulate_click(summary.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        let row = cx
+            .debug_bounds("agent-row-grandchild")
+            .expect("expanded roster lists nested agents");
+        cx.simulate_click(row.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert_eq!(
+            active_thread(&conversation_view, cx).read_with(cx, |view, _| view.session_id.clone()),
+            acp_v2::SessionId::new("grandchild")
+        );
+
+        let root_crumb: &'static str =
+            Box::leak(format!("breadcrumb-{root_session_id}").into_boxed_str());
+        assert!(cx.debug_bounds(root_crumb).is_some());
+        let child_crumb = cx
+            .debug_bounds("breadcrumb-child")
+            .expect("the breadcrumb lists every ancestor");
+        cx.simulate_click(child_crumb.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert_eq!(
+            active_thread(&conversation_view, cx).read_with(cx, |view, _| view.session_id.clone()),
+            acp_v2::SessionId::new("child")
+        );
+    }
+
+    #[gpui::test]
+    async fn test_stopping_a_subagent_stops_its_subtree(cx: &mut TestAppContext) {
+        init_test(cx);
+        let connection = StubAgentConnection::new();
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        let root_view = active_thread(&conversation_view, cx);
+        let root = root_view.read_with(cx, |view, _| view.thread.clone());
+        let child = announce_test_subagent(&root, "child", "Write tests", running_state(), cx);
+        announce_test_subagent(&child, "grandchild", "Fixtures", running_state(), cx);
+        announce_test_subagent(&root, "sibling", "Docs", running_state(), cx);
+
+        root_view.update(cx, |view, cx| view.stop_subagent(&child, cx));
+        cx.run_until_parked();
+        let mut cancelled = connection
+            .take_cancel_calls()
+            .into_iter()
+            .map(|session_id| session_id.0.to_string())
+            .collect::<Vec<_>>();
+        cancelled.sort();
+        assert_eq!(cancelled, ["child", "grandchild"]);
     }
 
     #[gpui::test]

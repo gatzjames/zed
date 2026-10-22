@@ -498,6 +498,25 @@ fn run_visual_tests(project_path: PathBuf, update_baseline: bool) -> Result<()> 
         }
     }
 
+    #[cfg(feature = "visual-tests")]
+    {
+        println!("\n--- Test: agent_tree (inbox, questions, breadcrumb) ---");
+        match run_agent_tree_visual_test(app_state.clone(), &mut cx, update_baseline) {
+            Ok(TestResult::Passed) => {
+                println!("✓ agent_tree: PASSED");
+                passed += 1;
+            }
+            Ok(TestResult::BaselineUpdated(_)) => {
+                println!("✓ agent_tree: Baselines updated");
+                updated += 1;
+            }
+            Err(e) => {
+                eprintln!("✗ agent_tree: FAILED - {}", e);
+                failed += 1;
+            }
+        }
+    }
+
     // Run Test 5: Agent Thread View tests
     #[cfg(feature = "visual-tests")]
     {
@@ -2307,6 +2326,372 @@ fn run_agent_thread_view_test(
             Ok(TestResult::BaselineUpdated(p.clone()))
         }
     }
+}
+
+/// Visual test for a conversation with nested subagents: the inbox showing a
+/// subagent's permission request, then another subagent's tabbed questions,
+/// the agents roster, and a nested subagent's breadcrumb.
+#[cfg(all(target_os = "macos", feature = "visual-tests"))]
+fn run_agent_tree_visual_test(
+    app_state: Arc<AppState>,
+    cx: &mut VisualTestAppContext,
+    update_baseline: bool,
+) -> Result<TestResult> {
+    use agent_ui::AgentPanel;
+
+    let project_path = tempfile::tempdir()?.keep().canonicalize()?.join("project");
+    std::fs::create_dir_all(&project_path)?;
+    let project = cx.update(|cx| {
+        project::Project::local(
+            app_state.client.clone(),
+            app_state.node_runtime.clone(),
+            app_state.user_store.clone(),
+            app_state.languages.clone(),
+            app_state.fs.clone(),
+            None,
+            project::LocalProjectFlags {
+                init_worktree_trust: false,
+                ..Default::default()
+            },
+            cx,
+        )
+    });
+    let add_worktree_task = project.update(cx, |project, cx| {
+        project.find_or_create_worktree(&project_path, true, cx)
+    });
+    cx.background_executor.allow_parking();
+    cx.foreground_executor
+        .block_test(add_worktree_task)
+        .context("Failed to add worktree")?;
+    cx.background_executor.forbid_parking();
+    cx.run_until_parked();
+
+    let connection = StubAgentConnection::new();
+    connection.set_next_prompt_updates(vec![
+        agent_client_protocol::schema::v1::SessionUpdate::AgentMessageChunk(
+            agent_client_protocol::schema::v1::ContentChunk::new(
+                "I'll split this into parallel tasks.".into(),
+            ),
+        ),
+    ]);
+    let stub_agent: Rc<dyn AgentServer> = Rc::new(StubAgentServer::new(connection));
+
+    let bounds = Bounds {
+        origin: point(px(0.0), px(0.0)),
+        size: size(px(500.0), px(900.0)),
+    };
+    let workspace_window: WindowHandle<Workspace> = cx
+        .update(|cx| {
+            cx.open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    focus: false,
+                    show: false,
+                    ..Default::default()
+                },
+                |window, cx| {
+                    cx.new(|cx| {
+                        Workspace::new(None, project.clone(), app_state.clone(), window, cx)
+                    })
+                },
+            )
+        })
+        .context("Failed to open agent window")?;
+    cx.run_until_parked();
+
+    let (weak_workspace, async_window_cx) = workspace_window
+        .update(cx, |workspace, window, cx| {
+            (workspace.weak_handle(), window.to_async(cx))
+        })
+        .context("Failed to get workspace handle")?;
+    cx.background_executor.allow_parking();
+    let panel = cx
+        .foreground_executor
+        .block_test(AgentPanel::load(weak_workspace, async_window_cx))
+        .context("Failed to load AgentPanel")?;
+    cx.background_executor.forbid_parking();
+    cx.update_window(workspace_window.into(), |_, _window, cx| {
+        workspace_window
+            .update(cx, |workspace, window, cx| {
+                workspace.add_panel(panel.clone(), window, cx);
+                workspace.open_panel::<AgentPanel>(window, cx);
+            })
+            .log_err();
+    })?;
+    cx.run_until_parked();
+    cx.update_window(workspace_window.into(), |_, window, cx| {
+        panel.update(cx, |panel, cx| {
+            panel.open_external_thread_with_server(stub_agent.clone(), window, cx);
+        });
+    })?;
+    cx.run_until_parked();
+
+    let conversation_view = cx
+        .read(|cx| panel.read(cx).active_thread_view_for_tests().cloned())
+        .ok_or_else(|| anyhow::anyhow!("No active conversation view"))?;
+    let root = cx
+        .read(|cx| {
+            conversation_view
+                .read(cx)
+                .active_thread()
+                .map(|active| active.read(cx).thread.clone())
+        })
+        .ok_or_else(|| anyhow::anyhow!("Thread not available"))?;
+    let send = root.update(cx, |thread, cx| {
+        thread.send(vec!["Refactor auth and add tests".into()], cx)
+    });
+    cx.background_executor.allow_parking();
+    cx.foreground_executor
+        .block_test(send)
+        .context("Failed to send message")?;
+    cx.background_executor.forbid_parking();
+    cx.run_until_parked();
+
+    let announce = |parent: &Entity<acp_thread::AcpThread>,
+                    session_id: &str,
+                    title: &str,
+                    state: acp_v2::StateUpdate,
+                    cx: &mut VisualTestAppContext|
+     -> Result<Entity<acp_thread::AcpThread>> {
+        let child = parent.update(cx, |parent, cx| {
+            parent.spawn_reported_subagent(acp_v2::SessionId::new(session_id), cx)
+        });
+        child.update(cx, |child, cx| {
+            child.apply_subagent_update(
+                acp_v2::SubagentUpdate::new(session_id)
+                    .title(title)
+                    .capabilities(
+                        acp_v2::SubagentSessionCapabilities::new()
+                            .cancel(acp_v2::SessionCancelCapabilities::new()),
+                    )
+                    .state(state),
+                cx,
+            )
+        })?;
+        cx.run_until_parked();
+        Ok(child)
+    };
+    let running = || acp_v2::StateUpdate::Running(acp_v2::RunningStateUpdate::new());
+    let link = |tool_call_id: &str, session_id: &str, cx: &mut VisualTestAppContext| {
+        root.update(cx, |thread, cx| {
+            thread.link_subagent_tool_call(
+                acp_v2::ToolCallId::new(tool_call_id),
+                acp_thread::SubagentSessionInfo {
+                    session_id: acp_v2::SessionId::new(session_id),
+                    message_start_index: 0,
+                    message_end_index: None,
+                },
+                cx,
+            );
+        });
+    };
+
+    // One entry per update, as agents deliver them.
+    for (id, title) in [
+        ("task-explore", "Explore auth call sites"),
+        ("task-tests", "Write session tests"),
+        ("task-docs", "Update docs"),
+    ] {
+        root.update(cx, |thread, cx| {
+            thread.upsert_local_tool_call(
+                acp_v2::ToolCallUpdate::new(id)
+                    .title(title)
+                    .kind(acp_v2::ToolKind::Other)
+                    .status(acp_v2::ToolCallStatus::Completed),
+                cx,
+            )
+        })?;
+        cx.run_until_parked();
+    }
+
+    let explore = announce(&root, "explore", "Explore auth call sites", running(), cx)?;
+    link("task-explore", "explore", cx);
+    explore.update(cx, |thread, cx| {
+        thread.upsert_local_tool_call(
+            acp_v2::ToolCallUpdate::new("read-session")
+                .title("Read crates/auth/src/session.rs")
+                .kind(acp_v2::ToolKind::Read)
+                .status(acp_v2::ToolCallStatus::InProgress),
+            cx,
+        )
+    })?;
+    let tests = announce(&root, "tests", "Write session tests", running(), cx)?;
+    link("task-tests", "tests", cx);
+    let fixtures = announce(&tests, "fixtures", "Build fixtures", running(), cx)?;
+    announce(
+        &root,
+        "docs",
+        "Update docs",
+        acp_v2::StateUpdate::Idle(
+            acp_v2::IdleStateUpdate::new().stop_reason(acp_v2::StopReason::EndTurn),
+        ),
+        cx,
+    )?;
+    link("task-docs", "docs", cx);
+
+    let _permission = fixtures.update(cx, |thread, cx| {
+        thread.request_tool_call_authorization(
+            agent_client_protocol::schema::v1::ToolCall::new("cargo-test", "cargo test -p auth")
+                .kind(agent_client_protocol::schema::v1::ToolKind::Execute)
+                .into(),
+            acp_thread::PermissionOptions::Flat(vec![
+                acp_v2::PermissionOption::new(
+                    "allow",
+                    "Allow once",
+                    acp_v2::PermissionOptionKind::AllowOnce,
+                ),
+                acp_v2::PermissionOption::new(
+                    "always",
+                    "Always allow",
+                    acp_v2::PermissionOptionKind::AllowAlways,
+                ),
+                acp_v2::PermissionOption::new(
+                    "reject",
+                    "Reject",
+                    acp_v2::PermissionOptionKind::RejectOnce,
+                ),
+            ]),
+            acp_thread::AuthorizationKind::PermissionGrant,
+            cx,
+        )
+    })?;
+    let question = |header: &str, text: &str, options: &[&str]| {
+        acp_v2::StringPropertySchema::new()
+            .one_of(
+                options
+                    .iter()
+                    .map(|option| acp_v2::EnumOption::new(*option, *option))
+                    .collect::<Vec<_>>(),
+            )
+            .title(header)
+            .description(text)
+    };
+    let _questions = explore.update(cx, |thread, cx| {
+        thread.request_elicitation(
+            acp_v2::CreateElicitationRequest::new(
+                acp_v2::ElicitationFormMode::new(
+                    acp_v2::ElicitationSessionScope::new(acp_v2::SessionId::new("explore")),
+                    acp_v2::ElicitationSchema::new()
+                        .property(
+                            "question_0",
+                            question(
+                                "Auth",
+                                "Which auth flow should we keep?",
+                                &["OAuth", "API keys"],
+                            ),
+                            false,
+                        )
+                        .property(
+                            "question_0_custom",
+                            acp_v2::StringPropertySchema::new().title("Other"),
+                            false,
+                        )
+                        .property(
+                            "question_1",
+                            question(
+                                "Storage",
+                                "Which backend should store sessions?",
+                                &["SQLite", "Postgres"],
+                            ),
+                            false,
+                        )
+                        .property(
+                            "question_1_custom",
+                            acp_v2::StringPropertySchema::new().title("Other"),
+                            false,
+                        )
+                        .property(
+                            "question_2",
+                            question(
+                                "Tests",
+                                "Where should the new tests live?",
+                                &["Unit tests", "Integration tests"],
+                            ),
+                            false,
+                        ),
+                ),
+                "Please answer the following questions.",
+            ),
+            cx,
+        )
+    })?;
+    cx.run_until_parked();
+
+    // Show the conversation as the window's root, so the screenshots capture it
+    // regardless of how the workspace lays out its docks.
+    struct ConversationHost(gpui::AnyView);
+    impl gpui::Render for ConversationHost {
+        fn render(
+            &mut self,
+            _window: &mut gpui::Window,
+            cx: &mut gpui::Context<Self>,
+        ) -> impl gpui::IntoElement {
+            use gpui::{ParentElement as _, Styled as _};
+            use theme::ActiveTheme as _;
+            gpui::div()
+                .size_full()
+                .bg(cx.theme().colors().panel_background)
+                .child(self.0.clone())
+        }
+    }
+    cx.update_window(workspace_window.into(), |_, window, cx| {
+        window.replace_root(cx, |_, _| {
+            ConversationHost(conversation_view.clone().into())
+        });
+    })?;
+    cx.run_until_parked();
+
+    let permission_result = run_visual_test(
+        "agent_tree_inbox_permission",
+        workspace_window.into(),
+        cx,
+        update_baseline,
+    )?;
+
+    cx.update_window(workspace_window.into(), |_, window, cx| {
+        if let Some(active) = conversation_view.read(cx).active_thread().cloned() {
+            let focus_handle = active.read(cx).focus_handle.clone();
+            window.focus(&focus_handle, cx);
+        }
+        window.dispatch_action(Box::new(agent_ui::FocusNextRequest), cx);
+    })?;
+    cx.run_until_parked();
+    let questions_result = run_visual_test(
+        "agent_tree_inbox_questions",
+        workspace_window.into(),
+        cx,
+        update_baseline,
+    )?;
+
+    cx.update_window(workspace_window.into(), |_, window, cx| {
+        conversation_view.update(cx, |view, cx| {
+            view.navigate_to_thread(acp_v2::SessionId::new("fixtures"), window, cx);
+        });
+    })?;
+    cx.run_until_parked();
+    let breadcrumb_result = run_visual_test(
+        "agent_tree_subagent_breadcrumb",
+        workspace_window.into(),
+        cx,
+        update_baseline,
+    )?;
+
+    cx.update_window(workspace_window.into(), |_, window, _cx| {
+        window.remove_window();
+    })
+    .log_err();
+    cx.run_until_parked();
+    for _ in 0..15 {
+        cx.advance_clock(Duration::from_millis(100));
+        cx.run_until_parked();
+    }
+
+    Ok([permission_result, questions_result, breadcrumb_result]
+        .into_iter()
+        .fold(TestResult::Passed, |result, next| match next {
+            TestResult::Passed => result,
+            updated @ TestResult::BaselineUpdated(_) => updated,
+        }))
 }
 
 /// Visual test for the Tool Permissions Settings UI page

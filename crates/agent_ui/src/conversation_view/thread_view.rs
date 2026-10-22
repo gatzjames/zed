@@ -675,6 +675,7 @@ pub struct ThreadView {
     pub new_server_version_available: Option<SharedString>,
     pub resumed_without_history: bool,
     inbox_list_expanded: bool,
+    roster_expanded: bool,
     pub _cancel_task: Option<Task<()>>,
     _save_task: Option<Task<()>>,
     _draft_resolve_task: Option<Task<()>>,
@@ -1184,6 +1185,7 @@ impl ThreadView {
             is_loading_contents: false,
             new_server_version_available: None,
             inbox_list_expanded: false,
+            roster_expanded: false,
             _cancel_task: None,
             _save_task: None,
             _draft_resolve_task: None,
@@ -2506,6 +2508,15 @@ impl ThreadView {
         cx.notify();
     }
 
+    /// Stops the subagent and everything it spawned.
+    pub(super) fn stop_subagent(&self, thread: &Entity<AcpThread>, cx: &mut Context<Self>) {
+        self.cancel_thread(thread, cx).detach();
+        let session_id = thread.read(cx).session_id().clone();
+        self.conversation.update(cx, |conversation, cx| {
+            conversation.cancel_descendants(&session_id, cx);
+        });
+    }
+
     fn cancel_thread(&self, thread: &Entity<AcpThread>, cx: &mut Context<Self>) -> Task<()> {
         let cancellation = thread.update(cx, |thread, cx| thread.cancel(cx));
         cx.spawn(async move |this, cx| {
@@ -3649,7 +3660,18 @@ impl ThreadView {
         let queue_is_empty = !self.has_queued_messages();
 
         let awaiting_permission = self.render_inbox(window, cx);
-        let has_awaiting_permission = awaiting_permission.is_some();
+        let roster = self.render_roster(cx);
+        let has_awaiting_permission = awaiting_permission.is_some() || roster.is_some();
+        let awaiting_permission = match (awaiting_permission, roster) {
+            (Some(inbox), Some(roster)) => Some(
+                v_flex()
+                    .child(inbox)
+                    .child(Divider::horizontal().color(DividerColor::Border))
+                    .child(roster)
+                    .into_any(),
+            ),
+            (inbox, roster) => inbox.or(roster),
+        };
 
         if changed_buffers.is_empty() && !has_plan && queue_is_empty && !has_awaiting_permission {
             return None;
@@ -4341,6 +4363,224 @@ impl ThreadView {
         }
     }
 
+    /// Every agent in the conversation with what it's doing. Only shown once
+    /// the main agent has spawned a subagent.
+    fn render_roster(&self, cx: &Context<Self>) -> Option<AnyElement> {
+        let nodes = self.conversation.read(cx).agent_tree(cx);
+        if nodes.len() <= 1 {
+            return None;
+        }
+        let subagents = nodes.iter().filter(|node| node.depth > 0);
+        let count = |matches: fn(AgentRunStatus) -> bool| {
+            subagents
+                .clone()
+                .filter(|node| matches(node.status))
+                .count()
+        };
+        let running =
+            count(|status| matches!(status, AgentRunStatus::Starting | AgentRunStatus::Running));
+        let waiting = count(|status| status == AgentRunStatus::WaitingForUser);
+        let done = count(|status| status == AgentRunStatus::Done);
+        let failed = count(|status| {
+            matches!(
+                status,
+                AgentRunStatus::Failed | AgentRunStatus::Cancelled | AgentRunStatus::Unknown
+            )
+        });
+        let summary = [
+            (running, "running"),
+            (waiting, "waiting"),
+            (done, "done"),
+            (failed, "stopped"),
+        ]
+        .into_iter()
+        .filter(|(count, _)| *count > 0)
+        .map(|(count, label)| format!("{count} {label}"))
+        .collect::<Vec<_>>()
+        .join(" · ");
+        // An agent waiting for the user is worth seeing without asking.
+        let expanded = self.roster_expanded || waiting > 0;
+
+        Some(
+            v_flex()
+                .id("agent-roster")
+                .debug_selector(|| "agent-roster".to_string())
+                .child(
+                    h_flex()
+                        .id("agent-roster-summary")
+                        .debug_selector(|| "agent-roster-summary".to_string())
+                        .p_1()
+                        .gap_1()
+                        .cursor_pointer()
+                        .when(expanded, |this| {
+                            this.border_b_1().border_color(cx.theme().colors().border)
+                        })
+                        .child(Disclosure::new("agent-roster-disclosure", expanded))
+                        .child(Label::new("Agents").size(LabelSize::Small))
+                        .child(
+                            Label::new(summary)
+                                .size(LabelSize::Small)
+                                .color(Color::Muted)
+                                .truncate(),
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.roster_expanded = !this.roster_expanded;
+                            cx.notify();
+                        })),
+                )
+                .when(expanded, |this| {
+                    this.child(
+                        v_flex()
+                            .id("agent-roster-rows")
+                            .max_h_40()
+                            .overflow_y_scroll()
+                            .children(nodes.iter().map(|node| self.render_roster_row(node, cx))),
+                    )
+                })
+                .into_any(),
+        )
+    }
+
+    fn render_roster_row(&self, node: &AgentNode, cx: &Context<Self>) -> AnyElement {
+        let session_id = node.session_id.clone();
+        let is_waiting_below = node.rollup == AgentRunStatus::WaitingForUser
+            && node.status != AgentRunStatus::WaitingForUser;
+        let activity = if is_waiting_below {
+            Some(SharedString::from("Waiting below"))
+        } else {
+            node.activity.clone()
+        };
+        let elapsed = node
+            .elapsed
+            .filter(|elapsed| *elapsed >= Duration::from_secs(1))
+            .map(duration_alt_display);
+        let row_id = format!("agent-row-{}", node.session_id);
+
+        h_flex()
+            .id(SharedString::from(row_id.clone()))
+            .debug_selector(move || row_id)
+            .w_full()
+            .min_w_0()
+            .py_0p5()
+            .pr_1()
+            .pl(px(8. + 14. * node.depth as f32))
+            .gap_1p5()
+            .cursor_pointer()
+            .hover(|style| style.bg(cx.theme().colors().element_hover))
+            .child(
+                h_flex()
+                    .w_4()
+                    .flex_none()
+                    .justify_center()
+                    .child(Self::render_agent_status_icon(node.rollup)),
+            )
+            .child(
+                Label::new(self.session_label(&node.session_id, cx))
+                    .size(LabelSize::Small)
+                    .truncate(),
+            )
+            .child(
+                h_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .children(activity.map(|activity| {
+                        Label::new(activity)
+                            .size(LabelSize::Small)
+                            .color(Color::Muted)
+                            .truncate()
+                    })),
+            )
+            .children(elapsed.map(|elapsed| {
+                Label::new(elapsed)
+                    .size(LabelSize::XSmall)
+                    .color(Color::Muted)
+            }))
+            .when(node.depth > 0, |this| {
+                let session_id = session_id.clone();
+                this.child(
+                    IconButton::new(
+                        SharedString::from(format!("agent-open-{}", node.session_id)),
+                        IconName::ArrowUpRight,
+                    )
+                    .icon_size(IconSize::XSmall)
+                    .tooltip(Tooltip::text("Open Subagent"))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        cx.stop_propagation();
+                        this.server_view
+                            .update(cx, |server_view, cx| {
+                                server_view.navigate_to_thread(session_id.clone(), window, cx);
+                            })
+                            .log_err();
+                    })),
+                )
+            })
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.show_agent(session_id.clone(), window, cx);
+            }))
+            .into_any_element()
+    }
+
+    fn render_agent_status_icon(status: AgentRunStatus) -> AnyElement {
+        match status {
+            AgentRunStatus::Starting | AgentRunStatus::Running => SpinnerLabel::new()
+                .size(LabelSize::XSmall)
+                .into_any_element(),
+            AgentRunStatus::WaitingForUser => Icon::new(IconName::Warning)
+                .size(IconSize::XSmall)
+                .color(Color::Warning)
+                .into_any_element(),
+            AgentRunStatus::Done => Icon::new(IconName::Check)
+                .size(IconSize::XSmall)
+                .color(Color::Success)
+                .into_any_element(),
+            AgentRunStatus::Failed => Icon::new(IconName::Close)
+                .size(IconSize::XSmall)
+                .color(Color::Error)
+                .into_any_element(),
+            AgentRunStatus::Cancelled | AgentRunStatus::Unknown => Icon::new(IconName::Circle)
+                .size(IconSize::XSmall)
+                .color(Color::Muted)
+                .into_any_element(),
+        }
+    }
+
+    /// A subagent is shown where its parent delegated to it.
+    fn show_agent(
+        &mut self,
+        session_id: acp_v2::SessionId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let delegation = {
+            let conversation = self.conversation.read(cx);
+            conversation
+                .threads
+                .get(&session_id)
+                .and_then(|thread| thread.read(cx).parent_session_id().cloned())
+                .map(|parent_id| {
+                    let entry_ix = conversation.threads.get(&parent_id).and_then(|parent| {
+                        let parent = parent.read(cx);
+                        let tool_call_id = parent.tool_call_for_subagent(&session_id)?.id.clone();
+                        parent
+                            .tool_call(&tool_call_id)
+                            .map(|(entry_ix, _)| entry_ix)
+                    });
+                    (parent_id, entry_ix)
+                })
+        };
+        match delegation {
+            Some((parent_id, Some(entry_ix))) => self.show_entry(parent_id, entry_ix, window, cx),
+            _ if session_id == self.session_id => {}
+            _ => {
+                self.server_view
+                    .update(cx, |server_view, cx| {
+                        server_view.navigate_to_thread(session_id, window, cx);
+                    })
+                    .log_err();
+            }
+        }
+    }
+
     fn render_inbox_questions(
         &self,
         session_id: &acp_v2::SessionId,
@@ -4471,7 +4711,7 @@ impl ThreadView {
                         .end_icon(Icon::new(IconName::ArrowUpRight).size(IconSize::XSmall))
                         .tooltip(Tooltip::text("Show in Conversation"))
                         .on_click(cx.listener(move |this, _, window, cx| {
-                            this.show_request(session_id.clone(), entry_ix, window, cx);
+                            this.show_entry(session_id.clone(), entry_ix, window, cx);
                         })),
                 )
             })
@@ -4604,7 +4844,7 @@ impl ThreadView {
         }
     }
 
-    fn show_request(
+    fn show_entry(
         &mut self,
         session_id: acp_v2::SessionId,
         entry_ix: usize,
@@ -5196,6 +5436,52 @@ impl ThreadView {
             })
     }
 
+    /// The agents above this subagent, each a link back to its view.
+    fn render_breadcrumb(&self, cx: &Context<Self>) -> Vec<AnyElement> {
+        let mut path = self
+            .conversation
+            .read(cx)
+            .session_path(&self.session_id, cx);
+        path.pop();
+        path.into_iter()
+            .flat_map(|session_id| {
+                let selector = format!("breadcrumb-{session_id}");
+                let label = self.session_label(&session_id, cx);
+                [
+                    div()
+                        .flex_none()
+                        .debug_selector(move || selector)
+                        .child(
+                            Button::new(
+                                SharedString::from(format!("breadcrumb-{session_id}")),
+                                label,
+                            )
+                            .label_size(LabelSize::Small)
+                            .color(Color::Muted)
+                            .on_click(cx.listener(
+                                move |this, _, window, cx| {
+                                    this.server_view
+                                        .update(cx, |server_view, cx| {
+                                            server_view.navigate_to_thread(
+                                                session_id.clone(),
+                                                window,
+                                                cx,
+                                            );
+                                        })
+                                        .log_err();
+                                },
+                            )),
+                        )
+                        .into_any_element(),
+                    Label::new("▸")
+                        .size(LabelSize::Small)
+                        .color(Color::Muted)
+                        .into_any_element(),
+                ]
+            })
+            .collect()
+    }
+
     pub(crate) fn render_subagent_titlebar(&mut self, cx: &mut Context<Self>) -> Option<Div> {
         if self.parent_session_id.is_none() {
             return None;
@@ -5237,12 +5523,9 @@ impl ThreadView {
                         .child(
                             h_flex()
                                 .flex_1()
-                                .gap_2()
-                                .child(
-                                    Icon::new(IconName::ForwardArrowUp)
-                                        .size(IconSize::Small)
-                                        .color(Color::Muted),
-                                )
+                                .min_w_0()
+                                .gap_1()
+                                .children(self.render_breadcrumb(cx))
                                 .child(self.title_editor.clone())
                                 .when(is_done && is_canceled_or_failed, |this| {
                                     this.child(Icon::new(IconName::Close).color(Color::Error))
@@ -5261,7 +5544,7 @@ impl ThreadView {
                                             .icon_color(Color::Error)
                                             .tooltip(Tooltip::text("Stop Subagent"))
                                             .on_click(cx.listener(move |this, _, _, cx| {
-                                                this.cancel_thread(&thread, cx).detach();
+                                                this.stop_subagent(&thread, cx);
                                             })),
                                     )
                                 })
@@ -11993,6 +12276,22 @@ impl ThreadView {
 
         let run_status =
             subagent_run_status(tool_call, thread.as_ref().map(|thread| thread.read(cx)), cx);
+        let (activity, descendant_count, descendants_waiting) = subagent_session_id
+            .as_ref()
+            .map(|session_id| {
+                let conversation = self.conversation.read(cx);
+                let (count, rollup) = conversation.descendant_summary(session_id, cx);
+                let activity = run_status
+                    .is_active()
+                    .then(|| conversation.agent_activity(session_id, cx))
+                    .flatten();
+                (
+                    activity,
+                    count,
+                    rollup == Some(AgentRunStatus::WaitingForUser),
+                )
+            })
+            .unwrap_or_default();
         let is_running = run_status.is_active();
         let is_failed = run_status == AgentRunStatus::Failed;
         let is_cancelled = matches!(
@@ -12140,6 +12439,33 @@ impl ThreadView {
                                                         .color(Color::Muted)
                                                         .truncate(),
                                                 )
+                                            })
+                                            .when_some(activity, |this, activity| {
+                                                this.child(
+                                                    Label::new(format!("· {activity}"))
+                                                        .size(LabelSize::Custom(
+                                                            self.tool_name_font_size(),
+                                                        ))
+                                                        .color(Color::Muted)
+                                                        .truncate(),
+                                                )
+                                            })
+                                            .when(descendant_count > 0, |this| {
+                                                this.child(
+                                                    Label::new(if descendant_count == 1 {
+                                                        "· 1 subagent".to_string()
+                                                    } else {
+                                                        format!("· {descendant_count} subagents")
+                                                    })
+                                                    .size(LabelSize::Custom(
+                                                        self.tool_name_font_size(),
+                                                    ))
+                                                    .color(if descendants_waiting {
+                                                        Color::Warning
+                                                    } else {
+                                                        Color::Muted
+                                                    }),
+                                                )
                                             }),
                                     )
                                     .when(files_changed > 0, |this| {
@@ -12233,7 +12559,7 @@ impl ThreadView {
                                         this.on_click(cx.listener(
                                             move |this, _event, _window, cx| {
                                                 telemetry::event!("Subagent Stopped");
-                                                this.cancel_thread(&thread, cx).detach();
+                                                this.stop_subagent(&thread, cx);
                                             },
                                         ))
                                     },
