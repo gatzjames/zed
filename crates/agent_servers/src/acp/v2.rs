@@ -761,6 +761,7 @@ impl AcpV2Connection {
                 session_modes: None,
                 config_options: Some(ConfigOptions::new(Rc::new(RefCell::new(Vec::new())))),
                 default_config_task: None,
+                subagent_parent: None,
                 _release_subscription: release_subscription,
             },
         );
@@ -1854,7 +1855,7 @@ impl ReceiptSessionSubmissions for V2SessionSubmissions {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use acp_thread::ElicitationStatus;
+    use acp_thread::{AgentThreadEntry, ElicitationStatus};
     use agent_client_protocol::{
         Responder,
         schema::v1::{self as acp_v1, ErrorCode},
@@ -2523,6 +2524,184 @@ mod tests {
                 });
             }
         }
+    }
+
+    fn announce_subagent(harness: &SessionHarness, parent: &str, child: &str) {
+        harness.send_update(
+            parent,
+            acp::SessionUpdate::SubagentUpdate(
+                acp::SubagentUpdate::new(child)
+                    .title(format!("{child} title"))
+                    .capabilities(
+                        acp::SubagentSessionCapabilities::new()
+                            .cancel(acp::SessionCancelCapabilities::new()),
+                    )
+                    .state(acp::StateUpdate::Running(acp::RunningStateUpdate::new())),
+            ),
+        );
+    }
+
+    #[gpui::test]
+    async fn v2_subagent_update_registers_child_and_routes_its_traffic(cx: &mut TestAppContext) {
+        let harness = SessionHarness::new(session_capabilities(), vec![], vec![], cx).await;
+        let parent = harness.thread(cx).await;
+        harness.send_update(
+            "session",
+            acp::SessionUpdate::ToolCallUpdate(
+                acp::ToolCallUpdate::new("task-1").title("Explore auth"),
+            ),
+        );
+        announce_subagent(&harness, "session", "child");
+        harness.send_update(
+            "child",
+            acp::SessionUpdate::SessionMessage(
+                acp::SessionMessage::new("task-1")
+                    .sender_session_id(acp::SessionId::new("session"))
+                    .content(vec![acp::ContentBlock::from("Find the call sites")]),
+            ),
+        );
+        harness.send_update(
+            "child",
+            acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(
+                acp::ContentBlock::from("Working on it"),
+                "reply",
+            )),
+        );
+        harness.drain_updates(cx).await;
+        let elicitation = harness
+            .agent
+            .send_request(acp::CreateElicitationRequest::new(
+                acp::ElicitationFormMode::new(
+                    acp::ElicitationSessionScope::new("child"),
+                    acp::ElicitationSchema::new().string("answer", true),
+                ),
+                "Which module?",
+            ));
+        harness.drain_updates(cx).await;
+
+        let child = parent.read_with(cx, |parent, _| {
+            parent
+                .subagent_thread(&acp::SessionId::new("child"))
+                .cloned()
+                .expect("announced child is registered")
+        });
+        child.read_with(cx, |child, _| {
+            assert_eq!(
+                child.parent_session_id(),
+                Some(&acp::SessionId::new("session"))
+            );
+            assert_eq!(child.title().as_deref(), Some("child title"));
+            assert_eq!(
+                child.run_status(),
+                acp_thread::AgentRunStatus::WaitingForUser
+            );
+            let [
+                AgentThreadEntry::UserMessage(task),
+                AgentThreadEntry::AssistantMessage(_),
+                AgentThreadEntry::Elicitation(_),
+            ] = child.entries()
+            else {
+                panic!("unexpected child entries: {:?}", child.entries());
+            };
+            assert_eq!(task.sender_session_id, Some(acp::SessionId::new("session")));
+        });
+        parent.read_with(cx, |parent, _| {
+            let (_, tool_call) = parent
+                .tool_call(&acp::ToolCallId::new("task-1"))
+                .expect("delegating tool call");
+            let link = tool_call
+                .subagent_session_info
+                .as_ref()
+                .expect("delegating tool call is linked to the child");
+            assert_eq!(link.session_id, acp::SessionId::new("child"));
+            assert_eq!(link.message_start_index, 0);
+            assert!(
+                parent.entries().len() == 1,
+                "child traffic stays out of the parent"
+            );
+        });
+        drop(elicitation);
+    }
+
+    #[gpui::test]
+    async fn v2_subagents_are_cancelled_but_never_closed(cx: &mut TestAppContext) {
+        let harness = SessionHarness::new(session_capabilities(), vec![], vec![], cx).await;
+        let parent = harness.thread(cx).await;
+        announce_subagent(&harness, "session", "child");
+        harness.send_update(
+            "child",
+            acp::SessionUpdate::StateUpdate(acp::StateUpdate::Running(
+                acp::RunningStateUpdate::new(),
+            )),
+        );
+        harness.drain_updates(cx).await;
+        let child = parent.read_with(cx, |parent, _| {
+            parent
+                .subagent_thread(&acp::SessionId::new("child"))
+                .cloned()
+                .expect("announced child")
+        });
+
+        let _cancelling = child.update(cx, |child, cx| child.cancel(cx));
+        let notification = bounded(harness.cancellations.recv(), cx)
+            .await
+            .expect("child cancel");
+        assert_eq!(notification.session_id, acp::SessionId::new("child"));
+
+        let closing = cx.update(|cx| {
+            harness
+                .client
+                .clone()
+                .close_session(&acp::SessionId::new("child"), cx)
+        });
+        assert!(closing.await.is_err(), "children can't be closed");
+        drop((child, parent));
+        cx.update(|_| {});
+        cx.run_until_parked();
+        assert!(
+            harness.closes.try_recv().is_err(),
+            "releasing a child sends nothing to the agent"
+        );
+        assert!(
+            !harness
+                .client
+                .sessions
+                .borrow()
+                .contains_key(&acp::SessionId::new("child")),
+            "released children are forgotten"
+        );
+    }
+
+    #[gpui::test]
+    async fn v2_nested_subagents_keep_their_owner(cx: &mut TestAppContext) {
+        let harness = SessionHarness::new(session_capabilities(), vec![], vec![], cx).await;
+        let parent = harness.thread(cx).await;
+        announce_subagent(&harness, "session", "child");
+        announce_subagent(&harness, "child", "grandchild");
+        // A second owner for an announced child is a protocol violation.
+        announce_subagent(&harness, "session", "grandchild");
+        harness.drain_updates(cx).await;
+
+        let child = parent.read_with(cx, |parent, _| {
+            assert!(
+                parent
+                    .subagent_thread(&acp::SessionId::new("grandchild"))
+                    .is_none()
+            );
+            parent
+                .subagent_thread(&acp::SessionId::new("child"))
+                .cloned()
+                .expect("child")
+        });
+        child.read_with(cx, |child, cx| {
+            let grandchild = child
+                .subagent_thread(&acp::SessionId::new("grandchild"))
+                .expect("grandchild belongs to the child");
+            assert_eq!(
+                grandchild.read(cx).parent_session_id(),
+                Some(&acp::SessionId::new("child"))
+            );
+        });
     }
 
     #[gpui::test]

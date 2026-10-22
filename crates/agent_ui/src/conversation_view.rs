@@ -1012,11 +1012,17 @@ impl ConnectedServerState {
             return Task::ready(Ok(()));
         }
         // Initiate cleanup before a replacement can rebind the same session IDs.
-        let tasks = self
+        let session_ids = self
             .threads
             .values()
-            .map(|view| {
-                let session_id = view.read(cx).thread.read(cx).session_id().clone();
+            .map(|view| view.read(cx).thread.read(cx))
+            // Agent-announced subagents are restricted sessions the client must not close.
+            .filter(|thread| thread.subagent_info().is_none())
+            .map(|thread| thread.session_id().clone())
+            .collect::<Vec<_>>();
+        let tasks = session_ids
+            .into_iter()
+            .map(|session_id| {
                 let closing = self.connection.clone().close_session(&session_id, cx);
                 async move { (session_id, closing.await) }
             })
@@ -1654,6 +1660,13 @@ impl ConversationView {
                     .map(|i| i.session_id.clone()),
                 _ => None,
             })
+            // Agent-announced children may not be linked to a tool call yet.
+            .chain(
+                thread
+                    .read(cx)
+                    .subagent_threads()
+                    .map(|subagent| subagent.read(cx).session_id().clone()),
+            )
             .collect::<Vec<_>>();
 
         if !subagent_sessions.is_empty() {
@@ -2521,14 +2534,27 @@ impl ConversationView {
         let Some(connected) = self.as_connected() else {
             return;
         };
-        if connected.threads.contains_key(&subagent_id)
-            || !connected.connection.supports_load_session()
-        {
+        if connected.threads.contains_key(&subagent_id) {
             return;
         }
         let Some(parent_thread) = connected.threads.get(&parent_session_id) else {
             return;
         };
+        // Children the agent announced are already live. Loading one would ask
+        // the agent to open a new top-level session under the child's id.
+        if let Some(subagent_thread) = parent_thread
+            .read(cx)
+            .thread
+            .read(cx)
+            .subagent_thread(&subagent_id)
+            .cloned()
+        {
+            self.register_subagent_thread(subagent_thread, window, cx);
+            return;
+        }
+        if !connected.connection.supports_load_session() {
+            return;
+        }
         let work_dirs = parent_thread
             .read(cx)
             .thread
@@ -2548,26 +2574,34 @@ impl ConversationView {
         cx.spawn_in(window, async move |this, cx| {
             let subagent_thread = subagent_thread_task.await?;
             this.update_in(cx, |this, window, cx| {
-                let Some(connected) = this.as_connected() else {
-                    return;
-                };
-                let subagent_session_id = subagent_thread.read(cx).session_id().clone();
-                if connected.threads.contains_key(&subagent_session_id) {
-                    return;
-                }
-                let conversation = connected.conversation.clone();
-                conversation.update(cx, |conversation, cx| {
-                    conversation.register_thread(subagent_thread.clone(), cx);
-                });
-                let view =
-                    this.new_thread_view(subagent_thread, conversation, false, None, window, cx);
-                let Some(connected) = this.as_connected_mut() else {
-                    return;
-                };
-                connected.threads.insert(subagent_session_id, view);
+                this.register_subagent_thread(subagent_thread, window, cx);
             })
         })
         .detach();
+    }
+
+    fn register_subagent_thread(
+        &mut self,
+        subagent_thread: Entity<AcpThread>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(connected) = self.as_connected() else {
+            return;
+        };
+        let subagent_session_id = subagent_thread.read(cx).session_id().clone();
+        if connected.threads.contains_key(&subagent_session_id) {
+            return;
+        }
+        let conversation = connected.conversation.clone();
+        conversation.update(cx, |conversation, cx| {
+            conversation.register_thread(subagent_thread.clone(), cx);
+        });
+        let view = self.new_thread_view(subagent_thread, conversation, false, None, window, cx);
+        let Some(connected) = self.as_connected_mut() else {
+            return;
+        };
+        connected.threads.insert(subagent_session_id, view);
     }
 
     fn spawn_external_agent_login(
@@ -6616,6 +6650,99 @@ pub(crate) mod tests {
             assert_eq!(view.list_state.item_count(), 0);
             assert!(view.thread.read(cx).notices().is_empty());
         });
+    }
+
+    #[gpui::test]
+    async fn test_reported_subagents_register_without_loading(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let connection = StubAgentConnection::new().with_supports_close_session(true);
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        let root_thread =
+            active_thread(&conversation_view, cx).read_with(cx, |view, _| view.thread.clone());
+        let root_session_id = root_thread.read_with(cx, |thread, _| thread.session_id().clone());
+        let child_session_id = acp_v2::SessionId::new("child");
+        let grandchild_session_id = acp_v2::SessionId::new("grandchild");
+
+        // A background subagent's delegating tool call completes right away.
+        root_thread
+            .update(cx, |thread, cx| {
+                thread.upsert_wire_tool_call(
+                    acp_v2::ToolCallUpdate::new("task-1")
+                        .title("Explore auth")
+                        .status(acp_v2::ToolCallStatus::Completed),
+                    cx,
+                )
+            })
+            .expect("delegating tool call");
+        let child = root_thread.update(cx, |thread, cx| {
+            thread.spawn_reported_subagent(child_session_id.clone(), cx)
+        });
+        conversation_view.read_with(cx, |view, _| {
+            assert!(
+                view.as_connected()
+                    .expect("connected")
+                    .threads
+                    .contains_key(&child_session_id),
+                "announced children get a view without a load round trip"
+            );
+        });
+        child
+            .update(cx, |child, cx| {
+                child.apply_subagent_update(
+                    acp_v2::SubagentUpdate::new(child_session_id.clone())
+                        .title("Explore auth")
+                        .state(acp_v2::StateUpdate::Running(
+                            acp_v2::RunningStateUpdate::new(),
+                        )),
+                    cx,
+                )
+            })
+            .expect("subagent update");
+        root_thread.update(cx, |thread, cx| {
+            thread.link_subagent_tool_call(
+                acp_v2::ToolCallId::new("task-1"),
+                acp_thread::SubagentSessionInfo {
+                    session_id: child_session_id.clone(),
+                    message_start_index: 0,
+                    message_end_index: None,
+                },
+                cx,
+            );
+        });
+        child.update(cx, |child, cx| {
+            child.spawn_reported_subagent(grandchild_session_id.clone(), cx);
+        });
+        cx.run_until_parked();
+
+        conversation_view.read_with(cx, |view, cx| {
+            let connected = view.as_connected().expect("connected");
+            assert!(connected.threads.contains_key(&grandchild_session_id));
+            let (_, tool_call) = root_thread
+                .read(cx)
+                .tool_call(&acp_v2::ToolCallId::new("task-1"))
+                .expect("delegating tool call");
+            assert_eq!(
+                thread_view::subagent_run_status(tool_call, Some(child.read(cx)), cx),
+                acp_thread::AgentRunStatus::Running,
+                "the card follows the subagent, not its completed tool call"
+            );
+        });
+
+        conversation_view
+            .update(cx, |view, cx| {
+                view.as_connected()
+                    .expect("connected")
+                    .close_all_sessions(cx)
+            })
+            .await
+            .expect("close sessions");
+        assert_eq!(
+            connection.take_close_session_calls(),
+            vec![root_session_id],
+            "the client never closes agent-announced subagents"
+        );
     }
 
     #[gpui::test]

@@ -2,9 +2,10 @@ use super::{
     AcpDebugLog, AcpDebugMessage, AcpSession, ClientContext, ConfigOptions, FlattenAcpResult as _,
     ForegroundWork, UnsupportedVersion, drain_foreground_queue, enqueue_notification,
     enqueue_request, first_class_terminal_auth_task, handle_v2_complete_elicitation,
-    handle_v2_create_elicitation, map_acp_error, mcp_configurations_for_project, respond_err,
-    respond_result, runtime, session_thread, terminal_auth_task_id, transport,
-    with_v2_client_ingress, work_dirs_from_session_info,
+    handle_v2_create_elicitation, is_subagent_session, map_acp_error,
+    mcp_configurations_for_project, respond_err, respond_result, runtime, session_thread,
+    subagents, terminal_auth_task_id, transport, with_v2_client_ingress,
+    work_dirs_from_session_info,
 };
 use acp_thread::{
     AgentConnection, AgentSessionInfo, AgentSessionList, AgentSessionListRequest,
@@ -47,6 +48,7 @@ use terminal::TerminalBuilder;
 use terminal::terminal_settings::{AlternateScroll, CursorShape};
 
 use crate::{CURSOR_ID, GEMINI_ID};
+use feature_flags::{AcpBetaFeatureFlag, FeatureFlagAppExt as _};
 
 pub const GEMINI_TERMINAL_AUTH_METHOD_ID: &str = "spawn-gemini-cli";
 const PARAMETERIZED_MODEL_PICKER_META_KEY: &str = "parameterizedModelPicker";
@@ -443,7 +445,9 @@ fn client_builder(
         )
 }
 
-fn client_capabilities_for_agent(agent_id: &AgentId) -> acp::ClientCapabilities {
+/// `subagents` opts into agent-announced child sessions, which are still an
+/// unstable protocol extension.
+fn client_capabilities_for_agent(agent_id: &AgentId, subagents: bool) -> acp::ClientCapabilities {
     let mut meta = acp::Meta::from_iter([
         ("terminal_output".into(), true.into()),
         ("terminal-auth".into(), true.into()),
@@ -473,6 +477,7 @@ fn client_capabilities_for_agent(agent_id: &AgentId) -> acp::ClientCapabilities 
                 .form(acp::ElicitationFormCapabilities::new())
                 .url(acp::ElicitationUrlCapabilities::new()),
         )
+        .subagents(subagents.then(acp::SubagentCapabilities::new))
         .meta(meta)
 }
 
@@ -526,6 +531,7 @@ impl AcpConnection {
         let client_session_list: Rc<RefCell<Option<Rc<AcpSessionList>>>> =
             Rc::new(RefCell::new(None));
         let request_elicitations = cx.new(|_| ElicitationStore::default());
+        let supports_subagents = cx.update(|cx| cx.has_flag::<AcpBetaFeatureFlag>());
 
         let dispatch_context = ClientContext {
             sessions: sessions.clone(),
@@ -587,7 +593,10 @@ impl AcpConnection {
         let initialize_response = connection
             .send_request(
                 acp::InitializeRequest::new(ProtocolVersion::V1)
-                    .client_capabilities(client_capabilities_for_agent(&agent_id))
+                    .client_capabilities(client_capabilities_for_agent(
+                        &agent_id,
+                        supports_subagents,
+                    ))
                     .client_info(
                         acp::Implementation::new("zed", version)
                             .title(release_channel.map(ToOwned::to_owned)),
@@ -780,6 +789,7 @@ impl AcpConnection {
                 session_modes,
                 config_options,
                 default_config_task,
+                subagent_parent: None,
                 _release_subscription: release_subscription,
             },
         );
@@ -5202,7 +5212,7 @@ mod tests {
 
     #[test]
     fn client_capabilities_include_elicitation() {
-        let capabilities = client_capabilities_for_agent(&AgentId::new("codex-acp"));
+        let capabilities = client_capabilities_for_agent(&AgentId::new("codex-acp"), false);
         let elicitation = capabilities
             .elicitation
             .expect("elicitation should always be advertised");
@@ -5515,7 +5525,7 @@ mod tests {
 
     #[test]
     fn cursor_client_capabilities_include_parameterized_model_picker_meta() {
-        let capabilities = client_capabilities_for_agent(&AgentId::new(CURSOR_ID));
+        let capabilities = client_capabilities_for_agent(&AgentId::new(CURSOR_ID), false);
         let meta = capabilities
             .meta
             .expect("expected client capabilities meta");
@@ -5530,7 +5540,7 @@ mod tests {
 
     #[test]
     fn non_cursor_client_capabilities_do_not_include_parameterized_model_picker_meta() {
-        let capabilities = client_capabilities_for_agent(&AgentId::new("codex-acp"));
+        let capabilities = client_capabilities_for_agent(&AgentId::new("codex-acp"), false);
         let meta = capabilities
             .meta
             .expect("expected client capabilities meta");
@@ -5540,7 +5550,7 @@ mod tests {
 
     #[test]
     fn client_capabilities_include_boolean_config_options() {
-        let capabilities = client_capabilities_for_agent(&AgentId::new("codex-acp"));
+        let capabilities = client_capabilities_for_agent(&AgentId::new("codex-acp"), false);
 
         assert!(
             capabilities
@@ -5553,7 +5563,7 @@ mod tests {
 
     #[test]
     fn client_capabilities_include_compaction_and_notices() {
-        let capabilities = client_capabilities_for_agent(&AgentId::new("codex-acp"));
+        let capabilities = client_capabilities_for_agent(&AgentId::new("codex-acp"), false);
         let capabilities =
             serde_json::to_value(capabilities).expect("client capabilities should serialize");
         let session = capabilities
@@ -7433,7 +7443,7 @@ exit 7
         let response = client_conn
             .send_request(
                 acp::InitializeRequest::new(ProtocolVersion::V1).client_capabilities(
-                    client_capabilities_for_agent(&AgentId::new("fake-agent")),
+                    client_capabilities_for_agent(&AgentId::new("fake-agent"), false),
                 ),
             )
             .block_task()
@@ -7509,6 +7519,128 @@ exit 7
             }
         }
         panic!("SDK dispatch did not drain within bounded ticks");
+    }
+
+    #[test]
+    fn client_capabilities_advertise_subagents_only_when_enabled() {
+        let agent_id = AgentId::new("claude-acp");
+        assert!(
+            client_capabilities_for_agent(&agent_id, false)
+                .subagents
+                .is_none()
+        );
+        assert!(
+            client_capabilities_for_agent(&agent_id, true)
+                .subagents
+                .is_some()
+        );
+    }
+
+    #[gpui::test]
+    async fn subagent_traffic_creates_child_sessions_without_loading_them(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (agent_sender, agent_receiver) = futures::channel::oneshot::channel();
+        let (connection, project, load_count, close_count, load_session_updates, _, _agent_io) =
+            connect_fake_agent_with_handle(None, Some(agent_sender), cx).await;
+        let agent = agent_receiver.await.expect("fake agent handle");
+        // Replay announces the child before the load response arrives.
+        load_session_updates.lock().expect("updates").extend([
+            acp::SessionUpdate::ToolCall(acp::ToolCall::new("task-1", "Explore auth")),
+            acp::SessionUpdate::SubagentUpdate(
+                acp::SubagentUpdate::new("child")
+                    .title("Explore auth")
+                    .state(acp::StateUpdate::Running(acp::RunningStateUpdate::new())),
+            ),
+        ]);
+        let parent = cx
+            .update(|cx| {
+                connection.clone().load_session(
+                    acp_v2::SessionId::new("parent"),
+                    project,
+                    PathList::new(&[std::path::Path::new("/a")]),
+                    None,
+                    cx,
+                )
+            })
+            .await
+            .expect("load parent session");
+
+        agent
+            .send_notification(acp::SessionNotification::new(
+                "child",
+                acp::SessionUpdate::SessionMessage(
+                    acp::SessionMessage::new("task-1")
+                        .sender_session_id(acp::SessionId::new("parent"))
+                        .content(vec![acp::ContentBlock::from("Find the call sites")]),
+                ),
+            ))
+            .expect("child task");
+        agent
+            .send_notification(acp::SessionNotification::new(
+                "child",
+                acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(
+                    "Working on it".into(),
+                )),
+            ))
+            .expect("child output");
+        let elicitation = agent.send_request(acp::CreateElicitationRequest::new(
+            acp::ElicitationFormMode::new(
+                acp::ElicitationSessionScope::new(acp::SessionId::new("child")),
+                acp::ElicitationSchema::new().string("answer", true),
+            ),
+            "Which module?",
+        ));
+        cx.run_until_parked();
+
+        let child = parent.read_with(cx, |parent, _| {
+            parent
+                .subagent_thread(&acp_v2::SessionId::new("child"))
+                .cloned()
+                .expect("announced child")
+        });
+        child.read_with(cx, |child, _| {
+            assert_eq!(child.title().as_deref(), Some("Explore auth"));
+            assert!(
+                child.foreground_activity().is_active(),
+                "v1 children follow the parent's state report"
+            );
+            assert!(matches!(
+                child.entries(),
+                [
+                    acp_thread::AgentThreadEntry::UserMessage(_),
+                    acp_thread::AgentThreadEntry::AssistantMessage(_),
+                    acp_thread::AgentThreadEntry::Elicitation(_),
+                ]
+            ));
+        });
+        parent.read_with(cx, |parent, _| {
+            let (_, tool_call) = parent
+                .tool_call(&acp_v2::ToolCallId::new("task-1"))
+                .expect("delegating tool call");
+            assert_eq!(
+                tool_call
+                    .subagent_session_info
+                    .as_ref()
+                    .map(|link| link.session_id.clone()),
+                Some(acp_v2::SessionId::new("child"))
+            );
+        });
+        assert_eq!(
+            load_count.load(Ordering::SeqCst),
+            1,
+            "only the parent is loaded"
+        );
+
+        drop(elicitation);
+        drop((child, parent));
+        cx.update(|_| {});
+        cx.run_until_parked();
+        assert_eq!(
+            close_count.load(Ordering::SeqCst),
+            1,
+            "only the parent session is closed"
+        );
     }
 
     #[gpui::test]
@@ -9562,6 +9694,18 @@ fn handle_session_notification(
     ctx: &ClientContext,
 ) {
     let session_id = acp_v2::SessionId::new(notification.session_id.0);
+    if let Some(traffic) = subagents::subagent_traffic_from_v1(&notification.update) {
+        let result = traffic.and_then(|traffic| {
+            let thread = session_thread(ctx, &session_id)?
+                .upgrade()
+                .context("Session was released before applying subagent traffic")?;
+            subagents::apply_subagent_traffic(&thread, traffic, &ctx.sessions, cx)
+        });
+        if let Err(error) = result {
+            log::error!("Failed to apply subagent update for {session_id:?}: {error:#}");
+        }
+        return;
+    }
     // Extract everything we need from the session while briefly borrowing.
     let (thread, session_modes, config_opts_data) = {
         let sessions = ctx.sessions.borrow();
@@ -9609,6 +9753,7 @@ fn handle_session_notification(
     }
 
     if let acp::SessionUpdate::SessionInfoUpdate(info_update) = &notification.update
+        && !is_subagent_session(ctx, &session_id)
         && let Some(session_list) = ctx.session_list.borrow().as_ref()
     {
         session_list.send_info_update(session_id.clone(), info_update.clone());

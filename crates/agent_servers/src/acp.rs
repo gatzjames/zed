@@ -1,6 +1,7 @@
 mod debug_log;
 mod runtime;
 mod session_updates;
+mod subagents;
 mod terminal_updates;
 mod transport;
 mod v1;
@@ -458,7 +459,15 @@ pub struct AcpSession {
     session_modes: Option<Rc<RefCell<acp::SessionModeState>>>,
     config_options: Option<ConfigOptions>,
     default_config_task: Option<Task<()>>,
+    /// Set for children the agent announced; the client never closes these.
+    subagent_parent: Option<acp_v2::SessionId>,
     _release_subscription: Subscription,
+}
+
+impl AcpSession {
+    fn is_subagent(&self) -> bool {
+        self.subagent_parent.is_some()
+    }
 }
 
 /// Builds a v2 terminal-notification handler without selecting it for application connections.
@@ -703,6 +712,14 @@ fn session_thread(
         .ok_or_else(|| acp::Error::internal_error().data(format!("unknown session: {session_id}")))
 }
 
+fn is_subagent_session(context: &ClientContext, session_id: &acp_v2::SessionId) -> bool {
+    context
+        .sessions
+        .borrow()
+        .get(session_id)
+        .is_some_and(AcpSession::is_subagent)
+}
+
 fn route_v2_session_notification(
     (notification, encoded_bytes): (InboundSessionNotification, usize),
     cx: &mut AsyncApp,
@@ -746,6 +763,40 @@ fn close_undelivered_session(
 fn apply_v2_session_notification(
     notification: InboundSessionNotification,
     thread: &WeakEntity<AcpThread>,
+    sessions: &Rc<RefCell<HashMap<acp_v2::SessionId, AcpSession>>>,
+    cx: &mut AsyncApp,
+) -> Result<()> {
+    let InboundSessionNotification {
+        session_id,
+        update,
+        meta,
+    } = notification;
+    let traffic = match update {
+        InboundSessionUpdate::Subagent(update) => subagents::SubagentTraffic::Update(update),
+        InboundSessionUpdate::SessionMessage(message) => {
+            subagents::SubagentTraffic::Message(subagents::SessionMessageUpdate::Message(message))
+        }
+        InboundSessionUpdate::SessionMessageChunk(chunk) => {
+            subagents::SubagentTraffic::Message(subagents::SessionMessageUpdate::Chunk(chunk))
+        }
+        update => {
+            let notification = InboundSessionNotification {
+                session_id,
+                update,
+                meta,
+            };
+            return apply_v2_thread_notification(notification, thread, sessions, cx);
+        }
+    };
+    let thread = thread
+        .upgrade()
+        .context("Session was released before applying subagent traffic")?;
+    subagents::apply_subagent_traffic(&thread, traffic, sessions, cx)
+}
+
+fn apply_v2_thread_notification(
+    notification: InboundSessionNotification,
+    thread: &WeakEntity<AcpThread>,
     sessions: &RefCell<HashMap<acp_v2::SessionId, AcpSession>>,
     cx: &mut AsyncApp,
 ) -> Result<()> {
@@ -784,6 +835,7 @@ fn handle_v2_session_notification(
         return;
     };
     if let InboundSessionUpdate::SessionInfo(update) = &notification.update
+        && !is_subagent_session(context, &notification.session_id)
         && let Some(session_list) = context.session_list.borrow().as_ref()
     {
         session_list.send_info_update(notification.session_id.clone(), update.clone());

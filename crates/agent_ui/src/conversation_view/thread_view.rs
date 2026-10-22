@@ -9,9 +9,10 @@ use agent_client_protocol::schema::v2 as acp_v2;
 use std::{cell::RefCell, path::Path};
 
 use acp_thread::{
-    Elicitation, ElicitationEntryId, ElicitationStatus, ForegroundActivity, OutputTokensUpdate,
-    SandboxAuthorizationDetails, SandboxFallbackAuthorizationDetails, SandboxNotAppliedReason,
-    SubmissionId, SubmissionResponse, SubmissionState, ToolCallLocation, decode_path_escapes,
+    AgentRunStatus, Elicitation, ElicitationEntryId, ElicitationStatus, ForegroundActivity,
+    OutputTokensUpdate, SandboxAuthorizationDetails, SandboxFallbackAuthorizationDetails,
+    SandboxNotAppliedReason, SubmissionId, SubmissionResponse, SubmissionState, ToolCallLocation,
+    decode_path_escapes,
 };
 use agent::{
     SandboxStatusKey, SandboxStatusRefresh, SkillLoadingIssue, SkillLoadingIssueKind,
@@ -5103,6 +5104,13 @@ impl ThreadView {
         let Some(parent_session_id) = self.parent_session_id.as_ref() else {
             return false;
         };
+        let thread = self.thread.read(cx);
+        if thread.subagent_info().is_some() {
+            return matches!(
+                thread.run_status(),
+                AgentRunStatus::Cancelled | AgentRunStatus::Failed | AgentRunStatus::Unknown
+            );
+        }
 
         let my_session_id = self.thread.read(cx).session_id().clone();
 
@@ -5134,7 +5142,13 @@ impl ThreadView {
 
         let server_view = self.server_view.clone();
         let thread = self.thread.clone();
-        let is_done = thread.read(cx).status() == ThreadStatus::Idle;
+        let subagent_info = thread.read(cx).subagent_info();
+        let can_stop = subagent_info.is_none_or(|subagent| subagent.can_cancel);
+        let is_done = if subagent_info.is_some() {
+            !thread.read(cx).run_status().is_active()
+        } else {
+            thread.read(cx).status() == ThreadStatus::Idle
+        };
         let is_canceled_or_failed = self.is_subagent_canceled_or_failed(cx);
 
         let max_content_width = AgentSettings::get_global(cx).max_content_width;
@@ -5178,7 +5192,7 @@ impl ThreadView {
                         .child(
                             h_flex()
                                 .gap_0p5()
-                                .when(!is_done, |this| {
+                                .when(!is_done && can_stop, |this| {
                                     this.child(
                                         IconButton::new("stop_subagent", IconName::Stop)
                                             .icon_size(IconSize::Small)
@@ -11719,25 +11733,20 @@ impl ThreadView {
         let files_changed = changed_buffers.len();
         let diff_stats = DiffStats::all_files(changed_buffers, cx);
 
-        let is_running = matches!(
-            tool_call.status(),
-            ToolCallStatus::Pending
-                | ToolCallStatus::InProgress
-                | ToolCallStatus::WaitingForConfirmation
+        let run_status =
+            subagent_run_status(tool_call, thread.as_ref().map(|thread| thread.read(cx)), cx);
+        let is_running = run_status.is_active();
+        let is_failed = run_status == AgentRunStatus::Failed;
+        let is_cancelled = matches!(
+            run_status,
+            AgentRunStatus::Cancelled | AgentRunStatus::Unknown
         );
-
-        let is_failed = matches!(
-            tool_call.status(),
-            ToolCallStatus::Failed | ToolCallStatus::Rejected
-        );
-
-        let is_cancelled = matches!(tool_call.status(), ToolCallStatus::Canceled)
-            || tool_call.content().iter().any(|c| match c {
-                ToolCallContent::ContentBlock { block, .. } => {
-                    block.text_content(cx) == Some("User canceled")
-                }
-                _ => false,
-            });
+        let can_stop = thread.as_ref().is_some_and(|thread| {
+            thread
+                .read(cx)
+                .subagent_info()
+                .is_none_or(|subagent| subagent.can_cancel)
+        });
 
         let model_name = thread_view
             .and_then(|view| view.read(cx).as_native_thread(cx))
@@ -11947,9 +11956,14 @@ impl ThreadView {
                                     }))
                             }),
                     )
-                    .when(is_running && subagent_session_id.is_some(), |buttons| {
-                        buttons.child(
-                            IconButton::new(format!("stop-subagent-{}", entry_ix), IconName::Stop)
+                    .when(
+                        is_running && can_stop && subagent_session_id.is_some(),
+                        |buttons| {
+                            buttons.child(
+                                IconButton::new(
+                                    format!("stop-subagent-{}", entry_ix),
+                                    IconName::Stop,
+                                )
                                 .icon_size(IconSize::Small)
                                 .icon_color(Color::Error)
                                 .tooltip(Tooltip::text("Stop Subagent"))
@@ -11966,8 +11980,9 @@ impl ThreadView {
                                         ))
                                     },
                                 ),
-                        )
-                    }),
+                            )
+                        },
+                    ),
             )
             .when_some(thread_view, |this, thread_view| {
                 let thread = &thread_view.read(cx).thread;
@@ -12055,11 +12070,12 @@ impl ThreadView {
         const MAX_PREVIEW_ENTRIES: usize = 8;
 
         let subagent_view = thread_view.read(cx);
-        let session_id = subagent_view.thread.read(cx).session_id().clone();
+        let subagent_thread = subagent_view.thread.read(cx);
+        let session_id = subagent_thread.session_id().clone();
 
         let is_canceled_or_failed = matches!(
-            tool_call.status(),
-            ToolCallStatus::Canceled | ToolCallStatus::Failed | ToolCallStatus::Rejected
+            subagent_run_status(tool_call, Some(subagent_thread), cx),
+            AgentRunStatus::Cancelled | AgentRunStatus::Failed | AgentRunStatus::Unknown
         );
 
         let editor_bg = cx.theme().colors().editor_background;
@@ -12076,16 +12092,22 @@ impl ThreadView {
                 .block_mouse_except_scroll()
         };
 
-        let entries = subagent_view.thread.read(cx).entries();
+        let entries = subagent_thread.entries();
         let total_entries = entries.len();
-        let mut entry_range = if let Some(info) = tool_call.subagent_session_info.as_ref() {
-            info.message_start_index
-                ..info
-                    .message_end_index
-                    .map(|i| (i + 1).min(total_entries))
-                    .unwrap_or(total_entries)
-        } else {
-            0..total_entries
+        let mut entry_range = match tool_call.subagent_session_info.as_ref() {
+            // An agent-announced subagent can be delegated to more than once, and
+            // each delegation's card covers only the work that answers it.
+            Some(info) if subagent_thread.subagent_info().is_some() => {
+                subagent_thread.session_message_range(info.message_start_index)
+            }
+            Some(info) => {
+                info.message_start_index
+                    ..info
+                        .message_end_index
+                        .map(|i| (i + 1).min(total_entries))
+                        .unwrap_or(total_entries)
+            }
+            None => 0..total_entries,
         };
         entry_range.start = entry_range
             .end
@@ -14084,6 +14106,34 @@ fn strip_leading_command(text: &str, command_name: &str) -> String {
         .and_then(|rest| rest.strip_prefix(command_name))
         .map(|rest| rest.trim_start().to_string())
         .unwrap_or_else(|| trimmed.to_string())
+}
+
+/// Agent-announced subagents report their own state; for any other subagent
+/// the delegating tool call is the only source of status.
+pub(crate) fn subagent_run_status(
+    tool_call: &ToolCall,
+    subagent: Option<&AcpThread>,
+    cx: &App,
+) -> AgentRunStatus {
+    if let Some(subagent) = subagent
+        && subagent.subagent_info().is_some()
+    {
+        return subagent.run_status();
+    }
+    let user_canceled = tool_call.content().iter().any(|content| match content {
+        ToolCallContent::ContentBlock { block, .. } => {
+            block.text_content(cx) == Some("User canceled")
+        }
+        _ => false,
+    });
+    match tool_call.status() {
+        ToolCallStatus::Pending | ToolCallStatus::InProgress => AgentRunStatus::Running,
+        ToolCallStatus::WaitingForConfirmation => AgentRunStatus::WaitingForUser,
+        ToolCallStatus::Canceled => AgentRunStatus::Cancelled,
+        _ if user_canceled => AgentRunStatus::Cancelled,
+        ToolCallStatus::Failed | ToolCallStatus::Rejected => AgentRunStatus::Failed,
+        ToolCallStatus::Completed => AgentRunStatus::Done,
+    }
 }
 
 #[cfg(test)]

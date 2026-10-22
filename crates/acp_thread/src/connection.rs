@@ -1479,13 +1479,13 @@ mod test_support {
             if let Some(error) = self.next_cancel_error.lock().take() {
                 return Err(error);
             }
+            // Like the ACP connections, accept sessions this stub didn't create,
+            // such as agent-announced subagents.
             if let Some(end_turn_tx) = self
                 .sessions
                 .lock()
                 .get_mut(session_id)
-                .ok_or_else(|| anyhow::anyhow!("Session not found"))?
-                .response_tx
-                .take()
+                .and_then(|session| session.response_tx.take())
             {
                 end_turn_tx
                     .send(acp_v1::StopReason::Cancelled)

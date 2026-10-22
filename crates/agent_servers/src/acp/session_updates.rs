@@ -172,6 +172,9 @@ pub enum InboundSessionUpdate {
     Notice(acp_v2::Notice),
     Compaction(acp_v2::CompactionUpdate),
     CompactionSummary(acp_v2::CompactionSummaryChunk),
+    Subagent(acp_v2::SubagentUpdate),
+    SessionMessage(acp_v2::SessionMessage),
+    SessionMessageChunk(acp_v2::SessionMessageChunk),
 }
 
 impl From<DecodedTerminalNotification> for InboundSessionNotification {
@@ -244,6 +247,13 @@ impl TryFrom<acp_v2::UpdateSessionNotification> for InboundSessionNotification {
             }
             acp_v2::SessionUpdate::CompactionSummaryChunk(chunk) => {
                 InboundSessionUpdate::CompactionSummary(chunk)
+            }
+            acp_v2::SessionUpdate::SubagentUpdate(update) => InboundSessionUpdate::Subagent(update),
+            acp_v2::SessionUpdate::SessionMessage(message) => {
+                InboundSessionUpdate::SessionMessage(message)
+            }
+            acp_v2::SessionUpdate::SessionMessageChunk(chunk) => {
+                InboundSessionUpdate::SessionMessageChunk(chunk)
             }
             update => {
                 notification.update = update;
@@ -331,6 +341,11 @@ impl InboundSessionNotification {
             InboundSessionUpdate::CompactionSummary(chunk) => {
                 thread.append_context_compaction_summary(chunk, cx);
                 Ok(())
+            }
+            InboundSessionUpdate::Subagent(_)
+            | InboundSessionUpdate::SessionMessage(_)
+            | InboundSessionUpdate::SessionMessageChunk(_) => {
+                anyhow::bail!("Subagent traffic must be applied by the connection")
             }
         }
     }

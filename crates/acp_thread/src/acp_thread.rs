@@ -9,6 +9,7 @@ pub mod elicitation;
 mod mention;
 pub mod notices;
 pub mod prompt_capabilities;
+mod subagents;
 mod submission;
 mod terminal;
 pub use ::terminal::HeadlessTerminal;
@@ -51,6 +52,7 @@ use std::process::ExitStatus;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 use std::{fmt::Display, mem, path::PathBuf, sync::Arc};
+pub use subagents::*;
 pub use submission::*;
 use task::{Shell, ShellBuilder};
 pub use terminal::*;
@@ -342,6 +344,9 @@ pub struct UserMessage {
     pub is_optimistic: bool,
     pub content: MessageContent,
     pub checkpoint: Option<Checkpoint>,
+    /// Set when another session sent this message, such as the task a parent
+    /// agent delegated to a subagent.
+    pub sender_session_id: Option<acp_v2::SessionId>,
     pub indented: bool,
 }
 
@@ -1112,6 +1117,9 @@ pub struct ToolCall {
     raw_output_content: Option<Box<ToolCallContent>>,
     pub tool_name: Option<SharedString>,
     pub subagent_session_info: Option<SubagentSessionInfo>,
+    /// A subagent link established by the client rather than carried in `meta`,
+    /// kept separately so that later protocol metadata patches don't erase it.
+    client_subagent_link: Option<SubagentSessionInfo>,
     pub sandbox_authorization_details: Option<SandboxAuthorizationDetails>,
     pub sandbox_fallback_authorization_details: Option<SandboxFallbackAuthorizationDetails>,
     /// Why this terminal command ran without the OS sandbox even though
@@ -1393,6 +1401,7 @@ impl ToolCall {
             raw_output_content: None,
             tool_name,
             subagent_session_info,
+            client_subagent_link: None,
             sandbox_authorization_details,
             sandbox_fallback_authorization_details,
             sandbox_not_applied,
@@ -1435,6 +1444,15 @@ impl ToolCall {
         self.local_status = (Some(status)
             != ToolCallStatus::from_reported(self.reported_status.as_ref()))
         .then_some(status);
+    }
+
+    /// Metadata from the agent takes precedence; only a link that the client
+    /// itself established can be replaced.
+    fn set_client_subagent_link(&mut self, link: SubagentSessionInfo) {
+        if self.subagent_session_info.is_none() || self.client_subagent_link.is_some() {
+            self.subagent_session_info = Some(link.clone());
+        }
+        self.client_subagent_link = Some(link);
     }
 
     fn set_local_status(&mut self, status: ToolCallStatus) {
@@ -1557,7 +1575,8 @@ impl ToolCall {
                 let cleared = matches!(&meta, MaybeUndefined::Null);
                 let meta_changed = MetadataUpdate::V2(meta).apply(&mut self.meta) || cleared;
                 if meta_changed {
-                    self.subagent_session_info = subagent_session_info_from_meta(&self.meta);
+                    self.subagent_session_info = subagent_session_info_from_meta(&self.meta)
+                        .or_else(|| self.client_subagent_link.clone());
                     self.sandbox_authorization_details =
                         sandbox_authorization_details_from_meta(&self.meta);
                     self.sandbox_fallback_authorization_details =
@@ -3501,6 +3520,13 @@ pub struct AcpThread {
     /// reveal text gradually without changing the authoritative message.
     streaming_text_buffer: Option<StreamingTextBuffer>,
     idle_sleep_prevention: IdleSleepPrevention,
+    /// Present when an ACP agent announced this session as one of its subagents.
+    subagent: Option<SubagentInfo>,
+    /// Children announced by the agent. Held strongly because the connection
+    /// only keeps weak handles and the agent never asks the client to open them.
+    subagents: IndexMap<acp_v2::SessionId, Entity<AcpThread>>,
+    /// Subagent links whose delegating tool call hasn't arrived yet.
+    pending_subagent_links: HashMap<acp_v2::ToolCallId, SubagentSessionInfo>,
 }
 
 enum IdleSleepPrevention {
@@ -3774,7 +3800,7 @@ impl AcpThread {
                 | AcpThreadEvent::ToolAuthorizationReceived(_)
                 | AcpThreadEvent::ElicitationRequested(_)
                 | AcpThreadEvent::ElicitationResponded(_) => {
-                    if !this.uses_reported_activity() {
+                    if !this.reports_foreground_state() {
                         this.sync_local_action_state(cx);
                     }
                     this.update_idle_sleep_prevention(cx);
@@ -3866,6 +3892,9 @@ impl AcpThread {
             ui_scroll_position: None,
             streaming_text_buffer: None,
             idle_sleep_prevention: IdleSleepPrevention::Inactive,
+            subagent: None,
+            subagents: IndexMap::default(),
+            pending_subagent_links: HashMap::default(),
         }
     }
 
@@ -4058,6 +4087,12 @@ impl AcpThread {
 
     pub fn uses_reported_activity(&self) -> bool {
         self.submissions.receipt_transport().is_some()
+    }
+
+    /// Agent-announced subagents get their state from the parent's
+    /// `subagent_update`, even on connections without receipt submissions.
+    pub fn reports_foreground_state(&self) -> bool {
+        self.uses_reported_activity() || self.subagent.is_some()
     }
 
     pub fn foreground_state(&self) -> Option<&acp_v2::StateUpdate> {
@@ -4433,7 +4468,7 @@ impl AcpThread {
         cx: &mut Context<Self>,
     ) -> Result<()> {
         anyhow::ensure!(
-            self.uses_reported_activity(),
+            self.reports_foreground_state(),
             "Session does not report foreground state"
         );
         let previous = self.foreground_activity();
@@ -4881,6 +4916,7 @@ impl AcpThread {
                         is_optimistic: false,
                         content: MessageContent::default(),
                         checkpoint: None,
+                        sender_session_id: None,
                         indented: false,
                     }));
                 Ok(MessageLocation::User { entry_index })
@@ -5032,6 +5068,7 @@ impl AcpThread {
                     is_optimistic,
                     content,
                     checkpoint: None,
+                    sender_session_id: None,
                     indented,
                 }),
                 cx,
@@ -5756,6 +5793,9 @@ impl AcpThread {
             if let Some(status) = status {
                 call.set_legacy_status(status);
             }
+            if let Some(link) = self.pending_subagent_links.remove(&id) {
+                call.set_client_subagent_link(link);
+            }
             self.push_entry(AgentThreadEntry::ToolCall(call), cx);
         };
 
@@ -5820,7 +5860,10 @@ impl AcpThread {
             cx.emit(AcpThreadEvent::EntryUpdated(index));
             result?;
         } else {
-            let call = ToolCall::from_patch(id.clone(), patch, languages, terminals, cx)?;
+            let mut call = ToolCall::from_patch(id.clone(), patch, languages, terminals, cx)?;
+            if let Some(link) = self.pending_subagent_links.remove(&id) {
+                call.set_client_subagent_link(link);
+            }
             self.push_entry(AgentThreadEntry::ToolCall(call), cx);
         }
         if locations_changed {
@@ -6737,6 +6780,7 @@ impl AcpThread {
                             is_optimistic: true,
                             content: block,
                             checkpoint: None,
+                            sender_session_id: None,
                             indented: false,
                         }),
                         cx,
@@ -7013,7 +7057,13 @@ impl AcpThread {
         cx: &mut Context<Self>,
     ) -> Result<Task<Result<()>>> {
         self.flush_streaming_text(cx);
-        if self.uses_reported_activity() {
+        if let Some(subagent) = &self.subagent {
+            anyhow::ensure!(
+                subagent.can_cancel,
+                "The agent doesn't allow cancelling this subagent"
+            );
+        }
+        if self.reports_foreground_state() {
             self.activity.ensure_observable()?;
             if self.foreground_activity() != ForegroundActivity::Idle
                 || self.has_unsettled_submissions()
@@ -21123,6 +21173,7 @@ mod tests {
                     is_optimistic: true,
                     content,
                     checkpoint: None,
+                    sender_session_id: None,
                     indented: false,
                 }),
                 cx,
