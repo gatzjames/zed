@@ -297,6 +297,8 @@
       "cmd-y": "agent::AllowOnce",
       "cmd-alt-a": "agent::OpenPermissionDropdown",
       "cmd-alt-z": "agent::RejectOnce",
+      "ctrl-alt-]": "agent::FocusNextRequest",
+      "ctrl-alt-[": "agent::FocusPreviousRequest",
       "pageup": "agent::ScrollOutputPageUp",
       "pagedown": "agent::ScrollOutputPageDown",
       "home": "agent::ScrollOutputToTop",

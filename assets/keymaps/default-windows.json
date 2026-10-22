@@ -263,6 +263,8 @@
       "shift-alt-a": "agent::AllowOnce",
       "ctrl-alt-a": "agent::OpenPermissionDropdown",
       "shift-alt-x": "agent::RejectOnce",
+      "shift-alt-]": "agent::FocusNextRequest",
+      "shift-alt-[": "agent::FocusPreviousRequest",
       "pageup": "agent::ScrollOutputPageUp",
       "pagedown": "agent::ScrollOutputPageDown",
       "home": "agent::ScrollOutputToTop",

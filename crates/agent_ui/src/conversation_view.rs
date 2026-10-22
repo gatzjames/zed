@@ -47,6 +47,9 @@ use project::{AgentId, AgentServerStore, Project, ProjectEntryId, ProjectPath};
 use crate::conversation_view::elicitation::{
     ElicitationCard, ElicitationCardHandlers, ElicitationFormState, should_render_elicitation,
 };
+use crate::conversation_view::user_requests::{
+    InboxItem, InboxItemId, RequestGrouping, UserRequestQueue, UserRequestRef,
+};
 use crate::message_editor::SessionCapabilities;
 use crate::{AgentThreadSource, DEFAULT_THREAD_TITLE, resolve_agent_image};
 use lru::LruCache;
@@ -114,6 +117,7 @@ pub(crate) mod elicitation;
 mod message_queue;
 mod thread_search_bar;
 mod thread_view;
+mod user_requests;
 pub use message_queue::*;
 pub use thread_view::*;
 
@@ -292,12 +296,24 @@ impl ProfileProvider for Entity<agent::Thread> {
     }
 }
 
+/// After the focused request is resolved, the next one is shown but ignores
+/// input briefly, so a repeated click or shortcut can't answer it unread.
+const INBOX_INPUT_GUARD: Duration = Duration::from_millis(300);
+
 #[derive(Default)]
 pub(crate) struct Conversation {
     threads: HashMap<acp_v2::SessionId, Entity<AcpThread>>,
-    permission_requests: IndexMap<acp_v2::SessionId, Vec<PermissionRequestId>>,
+    requests: UserRequestQueue,
+    /// The session whose view is showing; requests from its subtree come first.
+    viewer: Option<acp_v2::SessionId>,
+    input_guard_until: Option<Instant>,
+    _input_guard_timer: Option<Task<()>>,
     permission_selections: HashMap<PermissionRequestId, thread_view::PermissionSelection>,
-    elicitation_requests: IndexMap<acp_v2::SessionId, Vec<ElicitationEntryId>>,
+    /// Shared by every view so an answer started in one view survives in another.
+    elicitation_drafts: HashMap<(acp_v2::SessionId, ElicitationEntryId), ElicitationFormState>,
+    /// Sandbox prompts whose "surprising Unicode" warning the user has
+    /// acknowledged, wherever the prompt was shown.
+    acknowledged_confusable_warnings: HashSet<acp_v2::ToolCallId>,
     subscriptions: Vec<Subscription>,
     updated_at: Option<Instant>,
 }
@@ -306,8 +322,32 @@ impl Conversation {
     pub fn register_thread(&mut self, thread: Entity<AcpThread>, cx: &mut Context<Self>) {
         let thread_state = thread.read(cx);
         let session_id = thread_state.session_id().clone();
-        for request in thread_state.pending_permission_requests() {
-            self.add_permission_request(&session_id, &request.id);
+        let pending_permissions = thread_state
+            .pending_permission_requests()
+            .map(|request| request.id)
+            .collect::<Vec<_>>();
+        let pending_elicitations = thread_state
+            .entries()
+            .iter()
+            .filter_map(|entry| match entry {
+                AgentThreadEntry::Elicitation(id)
+                    if thread_state
+                        .elicitation(id)
+                        .is_some_and(|(_, elicitation)| {
+                            matches!(elicitation.status, ElicitationStatus::Pending { .. })
+                        }) =>
+                {
+                    Some(id.clone())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        self.threads.insert(session_id.clone(), thread.clone());
+        for request_id in pending_permissions {
+            self.enqueue_permission(&session_id, request_id, cx);
+        }
+        for elicitation_id in pending_elicitations {
+            self.enqueue_elicitation(&session_id, elicitation_id, cx);
         }
 
         let subscription = cx.subscribe(&thread, {
@@ -316,32 +356,35 @@ impl Conversation {
                 match event {
                     AcpThreadEvent::NoticesUpdated => return,
                     AcpThreadEvent::ToolAuthorizationRequested(id) => {
-                        this.add_permission_request(&session_id, id);
+                        this.enqueue_permission(&session_id, *id, cx);
                         cx.notify();
                     }
                     AcpThreadEvent::ToolAuthorizationReceived(id) => {
                         this.permission_selections.remove(id);
-                        if let Some(requests) = this.permission_requests.get_mut(&session_id) {
-                            requests.retain(|request_id| request_id != id);
-                            if requests.is_empty() {
-                                this.permission_requests.shift_remove(&session_id);
-                            }
-                        }
+                        this.dequeue(
+                            UserRequestRef::Permission {
+                                session_id: session_id.clone(),
+                                request_id: *id,
+                            },
+                            cx,
+                        );
                         cx.notify();
                     }
                     AcpThreadEvent::ElicitationRequested(id) => {
-                        this.elicitation_requests
-                            .entry(session_id.clone())
-                            .or_default()
-                            .push(id.clone());
+                        this.enqueue_elicitation(&session_id, id.clone(), cx);
+                        cx.notify();
                     }
                     AcpThreadEvent::ElicitationResponded(id) => {
-                        if let Some(elicitations) = this.elicitation_requests.get_mut(&session_id) {
-                            elicitations.retain(|elicitation_id| elicitation_id != id);
-                            if elicitations.is_empty() {
-                                this.elicitation_requests.shift_remove(&session_id);
-                            }
-                        }
+                        this.elicitation_drafts
+                            .remove(&(session_id.clone(), id.clone()));
+                        this.dequeue(
+                            UserRequestRef::Elicitation {
+                                session_id: session_id.clone(),
+                                elicitation_id: id.clone(),
+                            },
+                            cx,
+                        );
+                        cx.notify();
                     }
                     AcpThreadEvent::NewEntry
                     | AcpThreadEvent::ActivityConfirmedIdle
@@ -369,8 +412,230 @@ impl Conversation {
             }
         });
         self.subscriptions.push(subscription);
-        self.threads.insert(session_id, thread);
         cx.notify();
+    }
+
+    fn enqueue_permission(
+        &mut self,
+        session_id: &acp_v2::SessionId,
+        request_id: PermissionRequestId,
+        cx: &App,
+    ) {
+        let merge_key = self
+            .permission_request(session_id, request_id, cx)
+            .zip(self.threads.get(session_id))
+            .and_then(|(request, thread)| permission_merge_key(thread.read(cx), request, cx));
+        self.requests.insert(
+            UserRequestRef::Permission {
+                session_id: session_id.clone(),
+                request_id,
+            },
+            RequestGrouping::Single { merge_key },
+        );
+    }
+
+    fn enqueue_elicitation(
+        &mut self,
+        session_id: &acp_v2::SessionId,
+        elicitation_id: ElicitationEntryId,
+        cx: &App,
+    ) {
+        let is_form = self
+            .threads
+            .get(session_id)
+            .and_then(|thread| thread.read(cx).elicitation(&elicitation_id))
+            .is_some_and(|(_, elicitation)| {
+                matches!(elicitation.request.mode, acp_v2::ElicitationMode::Form(_))
+            });
+        let grouping = if is_form {
+            RequestGrouping::Questions
+        } else {
+            RequestGrouping::Single { merge_key: None }
+        };
+        self.requests.insert(
+            UserRequestRef::Elicitation {
+                session_id: session_id.clone(),
+                elicitation_id,
+            },
+            grouping,
+        );
+    }
+
+    fn dequeue(&mut self, request: UserRequestRef, cx: &mut Context<Self>) {
+        let threads = &self.threads;
+        let viewer = self.viewer.as_ref();
+        let focus_moved = self.requests.remove(&request, |session_id| {
+            is_in_subtree(threads, viewer, session_id, cx)
+        });
+        if focus_moved {
+            self.start_input_guard(cx);
+        }
+    }
+
+    fn start_input_guard(&mut self, cx: &mut Context<Self>) {
+        self.input_guard_until = Some(cx.background_executor().now() + INBOX_INPUT_GUARD);
+        self._input_guard_timer = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(INBOX_INPUT_GUARD).await;
+            this.update(cx, |_, cx| cx.notify()).ok();
+        }));
+    }
+
+    /// Whether the inbox accepts answers right now.
+    pub fn accepts_input(&self, cx: &App) -> bool {
+        self.input_guard_until
+            .is_none_or(|until| cx.background_executor().now() >= until)
+    }
+
+    fn request_is_pending(&self, request: &UserRequestRef, cx: &App) -> bool {
+        match request {
+            UserRequestRef::Permission {
+                session_id,
+                request_id,
+            } => self
+                .permission_request(session_id, *request_id, cx)
+                .is_some(),
+            UserRequestRef::Elicitation {
+                session_id,
+                elicitation_id,
+            } => self
+                .threads
+                .get(session_id)
+                .and_then(|thread| thread.read(cx).elicitation(elicitation_id))
+                .is_some_and(|(_, elicitation)| {
+                    matches!(elicitation.status, ElicitationStatus::Pending { .. })
+                }),
+        }
+    }
+
+    /// Every item waiting for the user across the conversation, in the order
+    /// the inbox shows them.
+    pub fn inbox_items(&self, cx: &App) -> Vec<InboxItem> {
+        let viewer = self.viewer.as_ref();
+        self.requests
+            .items(|session_id| is_in_subtree(&self.threads, viewer, session_id, cx))
+            .into_iter()
+            .filter_map(|mut item| {
+                item.members
+                    .retain(|request| self.request_is_pending(request, cx));
+                (!item.members.is_empty()).then_some(item)
+            })
+            .collect()
+    }
+
+    pub fn focused_inbox_item(&self, cx: &App) -> Option<InboxItem> {
+        let items = self.inbox_items(cx);
+        let focused = items
+            .iter()
+            .position(|item| Some(&item.id) == self.requests.focused_id())
+            .unwrap_or(0);
+        items.into_iter().nth(focused)
+    }
+
+    pub fn inbox_item_for_request(&self, request: &UserRequestRef) -> Option<InboxItemId> {
+        self.requests.item_for_request(request)
+    }
+
+    pub fn focus_inbox_item(&mut self, id: &InboxItemId, cx: &mut Context<Self>) {
+        if self.requests.focus(id) {
+            cx.notify();
+        }
+    }
+
+    pub fn cycle_inbox_focus(&mut self, offset: isize, cx: &mut Context<Self>) {
+        let threads = &self.threads;
+        let viewer = self.viewer.as_ref();
+        self.requests.cycle_focus(offset, |session_id| {
+            is_in_subtree(threads, viewer, session_id, cx)
+        });
+        cx.notify();
+    }
+
+    /// Requests from the viewed session's subtree come first, and focus moves
+    /// there if it was elsewhere.
+    pub fn set_viewer(&mut self, session_id: acp_v2::SessionId, cx: &mut Context<Self>) {
+        if self.viewer.as_ref() == Some(&session_id) {
+            return;
+        }
+        self.viewer = Some(session_id);
+        let threads = &self.threads;
+        let viewer = self.viewer.as_ref();
+        let focus_moved = self
+            .requests
+            .focus_viewer_subtree(|session_id| is_in_subtree(threads, viewer, session_id, cx));
+        if focus_moved {
+            self.start_input_guard(cx);
+        }
+        cx.notify();
+    }
+
+    /// The sessions from the conversation's root down to `session_id`.
+    pub fn session_path(&self, session_id: &acp_v2::SessionId, cx: &App) -> Vec<acp_v2::SessionId> {
+        let mut path = vec![session_id.clone()];
+        while let Some(parent) = path
+            .last()
+            .and_then(|session_id| self.threads.get(session_id))
+            .and_then(|thread| thread.read(cx).parent_session_id().cloned())
+        {
+            if path.contains(&parent) {
+                break;
+            }
+            path.push(parent);
+        }
+        path.reverse();
+        path
+    }
+
+    /// Whether any session in the conversation is waiting for the user.
+    pub fn has_pending_user_request(&self, cx: &App) -> bool {
+        self.requests
+            .requests()
+            .any(|request| self.request_is_pending(request, cx))
+    }
+
+    /// The other requests answered together with this one.
+    fn merged_permission_requests(
+        &self,
+        session_id: &acp_v2::SessionId,
+        request_id: PermissionRequestId,
+    ) -> Vec<(acp_v2::SessionId, PermissionRequestId)> {
+        let request = UserRequestRef::Permission {
+            session_id: session_id.clone(),
+            request_id,
+        };
+        let Some(item) = self.requests.item_for_request(&request) else {
+            return vec![(session_id.clone(), request_id)];
+        };
+        self.requests
+            .members(&item)
+            .into_iter()
+            .filter_map(|member| match member {
+                UserRequestRef::Permission {
+                    session_id,
+                    request_id,
+                } => Some((session_id, request_id)),
+                UserRequestRef::Elicitation { .. } => None,
+            })
+            .collect()
+    }
+
+    /// The focused inbox item's permission request, if it's one.
+    pub fn focused_permission<'a>(
+        &'a self,
+        cx: &'a App,
+    ) -> Option<(acp_v2::SessionId, &'a PermissionRequest)> {
+        self.focused_inbox_item(cx)?
+            .members
+            .into_iter()
+            .find_map(|member| match member {
+                UserRequestRef::Permission {
+                    session_id,
+                    request_id,
+                } => {
+                    let request = self.permission_request(&session_id, request_id, cx)?;
+                    Some((session_id, request))
+                }
+                UserRequestRef::Elicitation { .. } => None,
+            })
     }
 
     fn set_permission_choice(
@@ -425,20 +690,6 @@ impl Conversation {
         cx.notify();
     }
 
-    fn add_permission_request(
-        &mut self,
-        session_id: &acp_v2::SessionId,
-        request_id: &PermissionRequestId,
-    ) {
-        let requests = self
-            .permission_requests
-            .entry(session_id.clone())
-            .or_default();
-        if !requests.contains(request_id) {
-            requests.push(*request_id);
-        }
-    }
-
     fn permission_request<'a>(
         &'a self,
         session_id: &acp_v2::SessionId,
@@ -451,101 +702,209 @@ impl Conversation {
             .permission_request(request_id)
     }
 
-    fn pending_permission_request_for_session<'a>(
+    /// Pending permission requests from exactly `session_id`, in arrival order.
+    fn pending_permission_requests_for_session<'a>(
         &'a self,
-        session_id: &acp_v2::SessionId,
+        session_id: &'a acp_v2::SessionId,
         cx: &'a App,
-    ) -> Option<&'a PermissionRequest> {
-        self.permission_requests
-            .get(session_id)?
-            .iter()
-            .find_map(|id| self.permission_request(session_id, *id, cx))
+    ) -> impl Iterator<Item = &'a PermissionRequest> {
+        self.requests
+            .requests()
+            .filter_map(move |request| match request {
+                UserRequestRef::Permission {
+                    session_id: request_session_id,
+                    request_id,
+                } if request_session_id == session_id => {
+                    self.permission_request(session_id, *request_id, cx)
+                }
+                _ => None,
+            })
     }
 
-    fn pending_permission_request<'a>(
-        &'a self,
-        session_id: &acp_v2::SessionId,
-        cx: &'a App,
-    ) -> Option<(acp_v2::SessionId, &'a PermissionRequest)> {
-        if self
-            .threads
-            .get(session_id)?
-            .read(cx)
-            .parent_session_id()
-            .is_some()
-        {
-            return Some((
-                session_id.clone(),
-                self.pending_permission_request_for_session(session_id, cx)?,
-            ));
-        }
-        self.permission_requests.keys().find_map(|session_id| {
-            Some((
-                session_id.clone(),
-                self.pending_permission_request_for_session(session_id, cx)?,
-            ))
-        })
-    }
-
+    /// The tool call of the focused inbox item, if it's a tool permission.
     pub fn pending_tool_call<'a>(
         &'a self,
-        session_id: &acp_v2::SessionId,
         cx: &'a App,
     ) -> Option<(acp_v2::SessionId, acp_v2::ToolCallId, &'a PermissionOptions)> {
-        let (result_session_id, request) = self.pending_permission_request(session_id, cx)?;
+        let (session_id, request) = self.focused_permission(cx)?;
         Some((
-            result_session_id,
+            session_id,
             request.legacy_tool_call_id()?.clone(),
             request.legacy_options()?,
         ))
     }
 
-    pub fn subagents_awaiting_permission(&self, cx: &App) -> Vec<(acp_v2::SessionId, usize)> {
-        self.permission_requests
-            .iter()
-            .filter_map(|(session_id, _)| {
-                let thread = self.threads.get(session_id)?;
-                let count = self.pending_tool_call_count_for_session(session_id, cx);
-                if thread.read(cx).parent_session_id().is_some() && count > 0 {
-                    Some((session_id.clone(), count))
-                } else {
-                    None
-                }
-            })
-            .collect()
-    }
-
     /// Returns the first pending tool call request for exactly `session_id`.
-    /// Unlike `pending_tool_call`, this does not use the global FIFO pending
-    /// request for non-subagent sessions.
+    #[cfg(test)]
     pub fn pending_tool_call_for_session(
         &self,
         session_id: &acp_v2::SessionId,
         cx: &App,
     ) -> Option<acp_v2::ToolCallId> {
-        Some(
-            self.pending_permission_request_for_session(session_id, cx)?
-                .legacy_tool_call_id()?
-                .clone(),
-        )
+        self.pending_permission_requests_for_session(session_id, cx)
+            .find_map(|request| request.legacy_tool_call_id().cloned())
     }
 
+    #[cfg(test)]
     pub fn pending_tool_call_count_for_session(
         &self,
         session_id: &acp_v2::SessionId,
         cx: &App,
     ) -> usize {
-        self.permission_requests
-            .get(session_id)
-            .map(|ids| {
-                ids.iter()
-                    .filter(|id| {
-                        self.permission_request(session_id, **id, cx)
-                            .is_some_and(|request| request.legacy_tool_call_id().is_some())
+        self.pending_permission_requests_for_session(session_id, cx)
+            .filter(|request| request.legacy_tool_call_id().is_some())
+            .count()
+    }
+
+    /// Creates the draft for a pending form question, or drops it once the
+    /// question is no longer pending.
+    pub fn sync_elicitation_draft(
+        &mut self,
+        session_id: &acp_v2::SessionId,
+        elicitation_id: &ElicitationEntryId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(thread) = self.threads.get(session_id) else {
+            return;
+        };
+        let Some((_, elicitation)) = thread.read(cx).elicitation(elicitation_id) else {
+            return;
+        };
+        let is_pending = matches!(elicitation.status, ElicitationStatus::Pending { .. });
+        let schema = match &elicitation.request.mode {
+            acp_v2::ElicitationMode::Form(mode) => Some(mode.requested_schema.clone()),
+            _ => None,
+        };
+        let key = (session_id.clone(), elicitation_id.clone());
+        if !is_pending {
+            self.elicitation_drafts.remove(&key);
+        } else if let Some(schema) = schema
+            && !self.elicitation_drafts.contains_key(&key)
+        {
+            let draft = ElicitationFormState::new(&schema, window, cx);
+            self.elicitation_drafts.insert(key, draft);
+        }
+    }
+
+    pub fn elicitation_draft(
+        &self,
+        session_id: &acp_v2::SessionId,
+        elicitation_id: &ElicitationEntryId,
+    ) -> Option<&ElicitationFormState> {
+        self.elicitation_drafts
+            .get(&(session_id.clone(), elicitation_id.clone()))
+    }
+
+    pub fn update_elicitation_draft(
+        &mut self,
+        session_id: &acp_v2::SessionId,
+        elicitation_id: &ElicitationEntryId,
+        update: impl FnOnce(&mut ElicitationFormState),
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(draft) = self
+            .elicitation_drafts
+            .get_mut(&(session_id.clone(), elicitation_id.clone()))
+        {
+            update(draft);
+            cx.notify();
+        }
+    }
+
+    pub fn submit_elicitation(
+        &mut self,
+        session_id: acp_v2::SessionId,
+        elicitation_id: ElicitationEntryId,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(mode) = self
+            .threads
+            .get(&session_id)
+            .and_then(|thread| thread.read(cx).elicitation(&elicitation_id))
+            .map(|(_, elicitation)| elicitation.request.mode.clone())
+        else {
+            return;
+        };
+        match mode {
+            acp_v2::ElicitationMode::Form(mode) => {
+                let key = (session_id.clone(), elicitation_id.clone());
+                let Some(draft) = self.elicitation_drafts.get_mut(&key) else {
+                    return;
+                };
+                let Some(submission) = draft.begin_submission(cx) else {
+                    return;
+                };
+                let schema = mode.requested_schema;
+                let validation_task = cx.background_spawn(async move {
+                    let result = submission.validate(&schema);
+                    (submission, result)
+                });
+                cx.notify();
+                cx.spawn(async move |this, cx| {
+                    let (submission, result) = validation_task.await;
+                    this.update(cx, |this, cx| {
+                        let is_current =
+                            this.elicitation_drafts.get_mut(&key).is_some_and(|draft| {
+                                draft.validation_matches_current_values(&submission, cx)
+                            });
+                        if !is_current {
+                            cx.notify();
+                            return;
+                        }
+                        match result {
+                            Ok(content) => {
+                                this.respond_to_elicitation(
+                                    session_id,
+                                    elicitation_id,
+                                    acp_v2::CreateElicitationResponse::new(
+                                        acp_v2::ElicitationAction::Accept(
+                                            acp_v2::ElicitationAcceptAction::new().content(content),
+                                        ),
+                                    ),
+                                    cx,
+                                );
+                            }
+                            Err(errors) => {
+                                if let Some(draft) = this.elicitation_drafts.get_mut(&key) {
+                                    draft.set_errors(errors);
+                                }
+                                cx.notify();
+                            }
+                        }
                     })
-                    .count()
-            })
-            .unwrap_or(0)
+                    .log_err();
+                })
+                .detach();
+            }
+            acp_v2::ElicitationMode::Url(_) => {
+                self.respond_to_elicitation(
+                    session_id,
+                    elicitation_id,
+                    acp_v2::CreateElicitationResponse::new(acp_v2::ElicitationAction::Accept(
+                        acp_v2::ElicitationAcceptAction::new(),
+                    )),
+                    cx,
+                );
+            }
+            _ => {}
+        }
+    }
+
+    pub fn dismiss_url_elicitation(
+        &mut self,
+        session_id: &acp_v2::SessionId,
+        elicitation_id: &ElicitationEntryId,
+        cx: &mut Context<Self>,
+    ) {
+        self.elicitation_drafts
+            .remove(&(session_id.clone(), elicitation_id.clone()));
+        if let Some(thread) = self.threads.get(session_id) {
+            thread.update(cx, |thread, cx| {
+                thread.cancel_elicitation(elicitation_id, cx);
+            });
+        }
+        cx.notify();
     }
 
     pub fn respond_to_elicitation(
@@ -555,6 +914,8 @@ impl Conversation {
         response: acp_v2::CreateElicitationResponse,
         cx: &mut Context<Self>,
     ) -> Option<()> {
+        self.elicitation_drafts
+            .remove(&(session_id.clone(), elicitation_id.clone()));
         let thread = self.threads.get(&session_id)?.clone();
         thread.update(cx, |thread, cx| {
             thread.respond_to_elicitation(&elicitation_id, response, cx);
@@ -562,20 +923,29 @@ impl Conversation {
         Some(())
     }
 
-    pub fn authorize_pending_tool_call(
+    /// Answers the focused inbox item with the first option of `kind`.
+    pub fn authorize_focused_permission(
         &mut self,
-        session_id: &acp_v2::SessionId,
         kind: acp_v2::PermissionOptionKind,
         cx: &mut Context<Self>,
     ) -> Option<()> {
-        let (authorize_session_id, request) = self.pending_permission_request(session_id, cx)?;
-        let option = permission_option_for_action(request.legacy_options()?, kind)?;
-        self.authorize_permission_request(
-            authorize_session_id,
-            request.id,
-            SelectedPermissionOutcome::new(option.option_id.clone(), option.kind.clone()),
-            cx,
-        );
+        let (session_id, request) = self.focused_permission(cx)?;
+        let request_id = request.id;
+        if let Some(options) = request.legacy_options() {
+            let option = permission_option_for_action(options, kind)?;
+            let outcome =
+                SelectedPermissionOutcome::new(option.option_id.clone(), option.kind.clone());
+            self.authorize_permission_request(session_id, request_id, outcome, cx);
+        } else {
+            let option_id = request
+                .generic_request()?
+                .options
+                .iter()
+                .find(|option| option.kind == kind)?
+                .option_id
+                .clone();
+            self.select_permission_option(&session_id, request_id, option_id, cx);
+        }
         Some(())
     }
 
@@ -614,7 +984,20 @@ impl Conversation {
         self.authorize_permission_request(session_id, request.id, outcome, cx);
     }
 
+    /// Answers the request together with any identical requests merged with it.
     pub fn authorize_permission_request(
+        &mut self,
+        session_id: acp_v2::SessionId,
+        request_id: PermissionRequestId,
+        outcome: SelectedPermissionOutcome,
+        cx: &mut Context<Self>,
+    ) {
+        for (session_id, request_id) in self.merged_permission_requests(&session_id, request_id) {
+            self.authorize_single_permission_request(session_id, request_id, outcome.clone(), cx);
+        }
+    }
+
+    fn authorize_single_permission_request(
         &mut self,
         session_id: acp_v2::SessionId,
         request_id: PermissionRequestId,
@@ -655,12 +1038,14 @@ impl Conversation {
         option_id: acp_v2::PermissionOptionId,
         cx: &mut Context<Self>,
     ) {
-        let Some(thread) = self.threads.get(session_id) else {
-            return;
-        };
-        thread.update(cx, |thread, cx| {
-            thread.select_permission_option(request_id, option_id, cx);
-        });
+        for (session_id, request_id) in self.merged_permission_requests(session_id, request_id) {
+            let Some(thread) = self.threads.get(&session_id) else {
+                continue;
+            };
+            thread.update(cx, |thread, cx| {
+                thread.select_permission_option(request_id, option_id.clone(), cx);
+            });
+        }
         cx.notify();
     }
 
@@ -670,12 +1055,14 @@ impl Conversation {
         request_id: PermissionRequestId,
         cx: &mut Context<Self>,
     ) {
-        let Some(thread) = self.threads.get(session_id) else {
-            return;
-        };
-        thread.update(cx, |thread, cx| {
-            thread.cancel_permission_request(request_id, cx);
-        });
+        for (session_id, request_id) in self.merged_permission_requests(session_id, request_id) {
+            let Some(thread) = self.threads.get(&session_id) else {
+                continue;
+            };
+            thread.update(cx, |thread, cx| {
+                thread.cancel_permission_request(request_id, cx);
+            });
+        }
         cx.notify();
     }
 
@@ -685,6 +1072,79 @@ impl Conversation {
                 thread.set_work_dirs(work_dirs.clone(), cx);
             });
         }
+    }
+}
+
+/// Whether `session_id` is `root` or one of its descendants. Without a root,
+/// every session counts.
+fn is_in_subtree(
+    threads: &HashMap<acp_v2::SessionId, Entity<AcpThread>>,
+    root: Option<&acp_v2::SessionId>,
+    session_id: &acp_v2::SessionId,
+    cx: &App,
+) -> bool {
+    let Some(root) = root else {
+        return true;
+    };
+    let mut current = session_id.clone();
+    // Ownership never cycles, but bound the walk by the number of sessions anyway.
+    for _ in 0..=threads.len() {
+        if &current == root {
+            return true;
+        }
+        let Some(parent) = threads
+            .get(&current)
+            .and_then(|thread| thread.read(cx).parent_session_id().cloned())
+        else {
+            return false;
+        };
+        current = parent;
+    }
+    false
+}
+
+/// Requests with the same key are identical apart from the session that made
+/// them, so one answer can be given to all of them. Requests that can't be
+/// compared fully have no key and are never merged.
+fn permission_merge_key(
+    thread: &AcpThread,
+    request: &PermissionRequest,
+    cx: &App,
+) -> Option<String> {
+    if let Some(request) = request.generic_request() {
+        let mut value = serde_json::to_value(request).ok()?;
+        strip_session_identity(&mut value);
+        return Some(value.to_string());
+    }
+    let (_, tool_call) = thread.tool_call(request.legacy_tool_call_id()?)?;
+    let raw_input = tool_call.raw_input.as_ref()?;
+    Some(
+        serde_json::json!({
+            "authorization": format!("{:?}", request.legacy_kind()?),
+            "kind": format!("{:?}", tool_call.kind()),
+            "label": tool_call.label.read(cx).source(),
+            "input": raw_input,
+            "options": format!("{:?}", request.legacy_options()?),
+        })
+        .to_string(),
+    )
+}
+
+fn strip_session_identity(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(object) => {
+            object.remove("sessionId");
+            object.remove("toolCallId");
+            for value in object.values_mut() {
+                strip_session_identity(value);
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                strip_session_identity(value);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -803,6 +1263,9 @@ pub struct ConversationView {
     pending_selections: Vec<AgentContextSelection>,
     focus_handle: FocusHandle,
     notifications: Vec<WindowHandle<AgentNotification>>,
+    /// The request that the open notification is about, focused in the inbox
+    /// when the user chooses to view it.
+    notified_request: Option<UserRequestRef>,
     notification_subscriptions: HashMap<WindowHandle<AgentNotification>, Vec<Subscription>>,
     auth_task: Option<Task<()>>,
     loading_status: Option<SharedString>,
@@ -849,25 +1312,17 @@ impl ConversationView {
         &'a self,
         cx: &'a App,
     ) -> Option<(acp_v2::SessionId, acp_v2::ToolCallId, &'a PermissionOptions)> {
-        let session_id = self.active_thread()?.read(cx).session_id.clone();
         self.as_connected()?
             .conversation
             .read(cx)
-            .pending_tool_call(&session_id, cx)
+            .pending_tool_call(cx)
     }
 
-    pub fn root_thread_has_pending_tool_call(&self, cx: &App) -> bool {
-        let Some(root_thread) = self.root_thread_view() else {
-            return false;
-        };
-        let root_session_id = root_thread.read(cx).thread.read(cx).session_id().clone();
-        self.as_connected().is_some_and(|connected| {
-            connected
-                .conversation
-                .read(cx)
-                .pending_tool_call(&root_session_id, cx)
-                .is_some()
-        })
+    /// Whether any session in this conversation, including subagents, is
+    /// waiting for the user's input.
+    pub fn has_pending_user_request(&self, cx: &App) -> bool {
+        self.as_connected()
+            .is_some_and(|connected| connected.conversation.read(cx).has_pending_user_request(cx))
     }
 
     pub(crate) fn root_thread(&self, cx: &App) -> Option<Entity<AcpThread>> {
@@ -915,7 +1370,11 @@ impl ConversationView {
             return;
         };
 
-        connected.navigate_to_thread(session_id);
+        connected.navigate_to_thread(session_id.clone());
+        let conversation = connected.conversation.clone();
+        conversation.update(cx, |conversation, cx| {
+            conversation.set_viewer(session_id, cx);
+        });
         if let Some(view) = self.active_thread() {
             view.read(cx).activation_focus_handle(cx).focus(window, cx);
         }
@@ -1139,6 +1598,7 @@ impl ConversationView {
             saved_submissions: Vec::new(),
             pending_selections: Vec::new(),
             notifications: Vec::new(),
+            notified_request: None,
             notification_subscriptions: HashMap::default(),
             auth_task: None,
             loading_status: None,
@@ -1946,7 +2406,15 @@ impl ConversationView {
             return;
         };
         let is_subagent = thread.read(cx).parent_session_id().is_some();
-        if !is_subagent && affects_thread_metadata(event) {
+        // A subagent waiting for the user marks the whole conversation as waiting.
+        let is_user_request = matches!(
+            event,
+            AcpThreadEvent::ToolAuthorizationRequested(_)
+                | AcpThreadEvent::ToolAuthorizationReceived(_)
+                | AcpThreadEvent::ElicitationRequested(_)
+                | AcpThreadEvent::ElicitationResponded(_)
+        );
+        if (!is_subagent || is_user_request) && affects_thread_metadata(event) {
             cx.emit(RootThreadUpdated);
         }
         match event {
@@ -2031,12 +2499,28 @@ impl ConversationView {
             AcpThreadEvent::SubagentSpawned(subagent_session_id) => {
                 self.load_subagent_session(subagent_session_id.clone(), session_id, window, cx)
             }
-            AcpThreadEvent::ToolAuthorizationRequested(_) => {
-                self.notify_with_sound("Waiting for tool confirmation", IconName::Info, window, cx);
+            AcpThreadEvent::ToolAuthorizationRequested(request_id) => {
+                self.notify_user_request(
+                    "Waiting for tool confirmation",
+                    UserRequestRef::Permission {
+                        session_id,
+                        request_id: *request_id,
+                    },
+                    window,
+                    cx,
+                );
             }
             AcpThreadEvent::ToolAuthorizationReceived(_) => {}
-            AcpThreadEvent::ElicitationRequested(_) => {
-                self.notify_with_sound("Waiting for input", IconName::Info, window, cx);
+            AcpThreadEvent::ElicitationRequested(elicitation_id) => {
+                self.notify_user_request(
+                    "Waiting for input",
+                    UserRequestRef::Elicitation {
+                        session_id,
+                        elicitation_id: elicitation_id.clone(),
+                    },
+                    window,
+                    cx,
+                );
             }
             AcpThreadEvent::ElicitationResponded(_) => {}
             AcpThreadEvent::Retry(retry) => {
@@ -3357,6 +3841,20 @@ impl ConversationView {
         )
     }
 
+    fn notify_user_request(
+        &mut self,
+        caption: impl Into<SharedString>,
+        request: UserRequestRef,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Only one notification shows at a time, so it stays about the first request.
+        if self.notifications.is_empty() {
+            self.notified_request = Some(request);
+        }
+        self.notify_with_sound(caption, IconName::Info, window, cx);
+    }
+
     fn notify_with_sound(
         &mut self,
         caption: impl Into<SharedString>,
@@ -3540,6 +4038,7 @@ impl ConversationView {
                                 return;
                             };
                             cx.activate(true);
+                            this.focus_notified_request(cx);
 
                             let workspace_handle = this.workspace.clone();
                             let agent = this.connection_key.clone();
@@ -3651,7 +4150,22 @@ impl ConversationView {
         }
     }
 
+    fn focus_notified_request(&mut self, cx: &mut Context<Self>) {
+        let Some(request) = self.notified_request.take() else {
+            return;
+        };
+        let Some(connected) = self.as_connected() else {
+            return;
+        };
+        connected.conversation.update(cx, |conversation, cx| {
+            if let Some(item) = conversation.inbox_item_for_request(&request) {
+                conversation.focus_inbox_item(&item, cx);
+            }
+        });
+    }
+
     pub(crate) fn dismiss_notifications(&mut self, cx: &mut Context<Self>) -> bool {
+        self.notified_request = None;
         let had_notifications = !self.notifications.is_empty();
         for window in self.notifications.drain(..) {
             window
@@ -7028,9 +7542,9 @@ pub(crate) mod tests {
             .clone()
             .expect("connection should preload an elicitation");
         let active_thread = active_thread(&conversation_view, cx);
-        active_thread.read_with(cx, |thread, _cx| {
+        active_thread.read_with(cx, |thread, cx| {
             assert!(
-                thread.has_elicitation_form_state(&elicitation_id),
+                thread.has_elicitation_form_state(&elicitation_id, cx),
                 "pending form elicitations that predate ThreadView construction should be usable"
             );
         });
@@ -16959,7 +17473,7 @@ pub(crate) mod tests {
         })
     }
 
-    fn select_embedded_child_permission(
+    fn select_child_permission(
         child_view: &Entity<ThreadView>,
         with_patterns: bool,
         cx: &mut VisualTestContext,
@@ -16967,10 +17481,7 @@ pub(crate) mod tests {
         let handle = child_view.read_with(cx, |view, _| view.permission_dropdown_handle.clone());
         cx.update(|window, cx| handle.show(window, cx));
         cx.run_until_parked();
-        assert!(
-            handle.is_deployed(),
-            "the embedded child's dropdown should open"
-        );
+        assert!(handle.is_deployed(), "the child's dropdown should open");
         let choice = cx
             .debug_bounds("MENU_ITEM-Always for terminal")
             .expect("the rendered dropdown should offer the terminal-wide choice");
@@ -16991,7 +17502,7 @@ pub(crate) mod tests {
     }
 
     #[gpui::test]
-    async fn test_embedded_child_permission_selection_uses_conversation_and_cleans_up(
+    async fn test_child_permission_in_inbox_uses_conversation_selection_and_cleans_up(
         cx: &mut TestAppContext,
     ) {
         init_test(cx);
@@ -17069,6 +17580,20 @@ pub(crate) mod tests {
             index: 0,
         });
         cx.run_until_parked();
+        // The parent's request arrived first, so each child request needs focus.
+        let focus_child_request = |request_id: PermissionRequestId, cx: &mut VisualTestContext| {
+            conversation.update(cx, |conversation, cx| {
+                let item = conversation
+                    .inbox_item_for_request(&UserRequestRef::Permission {
+                        session_id: child_session_id.clone(),
+                        request_id,
+                    })
+                    .expect("queued child request");
+                conversation.focus_inbox_item(&item, cx);
+            });
+            cx.executor().advance_clock(INBOX_INPUT_GUARD);
+            cx.run_until_parked();
+        };
 
         let mut child_request_ids = HashSet::default();
         for with_patterns in [false, true] {
@@ -17101,22 +17626,23 @@ pub(crate) mod tests {
                 );
                 assert!(child_request_ids.insert(request_id));
                 cx.run_until_parked();
+                focus_child_request(request_id, cx);
                 assert!(
                     cx.debug_bounds("PERMISSION_BUTTONS-embedded-permission-child-Only this time")
                         .is_some(),
-                    "the running child card should display a fresh default selection in the root"
+                    "the root's inbox should display a fresh default selection for the child"
                 );
                 assert_eq!(
                     active_thread(&conversation_view, cx),
                     root_view,
-                    "the child controls must remain embedded, not in a standalone child view"
+                    "the child is answered from the root's inbox, not its own view"
                 );
-                select_embedded_child_permission(&child_view, with_patterns, cx);
+                select_child_permission(&child_view, with_patterns, cx);
                 conversation.read_with(cx, |conversation, _| {
                     let selection = conversation
                         .permission_selections
                         .get(&request_id)
-                        .expect("embedded controls must write to the shared owner");
+                        .expect("inbox controls must write to the shared owner");
                     if with_patterns {
                         assert!(
                             matches!(selection, thread_view::PermissionSelection::SelectedPatterns(checked) if checked == &[0])
@@ -17132,7 +17658,7 @@ pub(crate) mod tests {
                     } else {
                         "PERMISSION_BUTTONS-embedded-permission-child-Always for terminal"
                     })
-                    .expect("the embedded card must render the shared selection");
+                    .expect("the inbox card must render the shared selection");
 
                 match resolution % 3 {
                     0 => {
@@ -17147,7 +17673,7 @@ pub(crate) mod tests {
                         let acp_thread::RequestPermissionOutcome::Selected(outcome) =
                             response.await
                         else {
-                            panic!("the embedded Allow button should authorize the child request");
+                            panic!("the inbox Allow button should authorize the child request");
                         };
                         assert_eq!(outcome.option_id, expected_outcome.option_id);
                         assert_eq!(outcome.option_kind, expected_outcome.option_kind);
@@ -17184,6 +17710,7 @@ pub(crate) mod tests {
                             );
                         assert!(child_request_ids.insert(successor_id));
                         cx.run_until_parked();
+                        focus_child_request(successor_id, cx);
                         assert!(matches!(
                             response.await,
                             acp_thread::RequestPermissionOutcome::Cancelled
@@ -17209,7 +17736,7 @@ pub(crate) mod tests {
                             .is_some(),
                             "a superseding request must not inherit the previous UUID's selection"
                         );
-                        select_embedded_child_permission(&child_view, with_patterns, cx);
+                        select_child_permission(&child_view, with_patterns, cx);
                         child.update(cx, |thread, cx| {
                             thread.cancel_permission_request(successor_id, cx);
                         });
@@ -17358,12 +17885,7 @@ pub(crate) mod tests {
                         .pending_tool_call_count_for_session(&session_id, cx),
                     0
                 );
-                assert!(
-                    view.conversation
-                        .read(cx)
-                        .pending_tool_call(&session_id, cx)
-                        .is_none()
-                );
+                assert!(view.conversation.read(cx).pending_tool_call(cx).is_none());
             });
         }
     }
@@ -17527,12 +18049,7 @@ pub(crate) mod tests {
         assert!(matches!(second_response.await,
             acp_thread::RequestPermissionOutcome::Selected(outcome) if outcome.option_id == "allow".into()));
         thread_view.read_with(cx, |view, cx| {
-            assert!(
-                view.conversation
-                    .read(cx)
-                    .pending_tool_call(&session_id, cx)
-                    .is_none()
-            );
+            assert!(view.conversation.read(cx).pending_tool_call(cx).is_none());
         });
     }
 
@@ -17562,7 +18079,7 @@ pub(crate) mod tests {
         cx.read(|cx| {
             let (_, tool_call_id, _) = conversation
                 .read(cx)
-                .pending_tool_call(&session_id, cx)
+                .pending_tool_call(cx)
                 .expect("Expected a pending tool call");
             assert_eq!(tool_call_id, acp_v2::ToolCallId::new("tc-1"));
         });
@@ -17586,7 +18103,7 @@ pub(crate) mod tests {
         cx.read(|cx| {
             let (_, tool_call_id, _) = conversation
                 .read(cx)
-                .pending_tool_call(&session_id, cx)
+                .pending_tool_call(cx)
                 .expect("Expected tc-2 to be pending after tc-1 was authorized");
             assert_eq!(tool_call_id, acp_v2::ToolCallId::new("tc-2"));
         });
@@ -17609,10 +18126,7 @@ pub(crate) mod tests {
 
         cx.read(|cx| {
             assert!(
-                conversation
-                    .read(cx)
-                    .pending_tool_call(&session_id, cx)
-                    .is_none(),
+                conversation.read(cx).pending_tool_call(cx).is_none(),
                 "Expected no pending tool calls after both were authorized"
             );
         });
@@ -17688,13 +18202,10 @@ pub(crate) mod tests {
                 conversation.pending_tool_call_count_for_session(&child_session_id, cx),
                 2
             );
-            assert_eq!(
-                conversation.subagents_awaiting_permission(cx),
-                vec![(child_session_id.clone(), 2)]
-            );
+            assert_eq!(conversation.inbox_items(cx).len(), 2);
             assert_eq!(
                 conversation
-                    .pending_tool_call(&root_session_id, cx)
+                    .pending_tool_call(cx)
                     .expect("child is discoverable")
                     .0,
                 child_session_id
@@ -17713,32 +18224,25 @@ pub(crate) mod tests {
                 conversation.pending_tool_call_count_for_session(&child_session_id, cx),
                 1
             );
-            assert_eq!(
-                conversation.subagents_awaiting_permission(cx),
-                vec![(child_session_id.clone(), 1)]
-            );
+            assert_eq!(conversation.inbox_items(cx).len(), 1);
         });
         cx.update(|cx| {
             child.update(cx, |thread, cx| {
                 thread.cancel_permission_request(second_id, cx)
             });
             let conversation = conversation.read(cx);
-            assert!(
-                conversation
-                    .pending_tool_call(&root_session_id, cx)
-                    .is_none()
-            );
+            assert!(conversation.pending_tool_call(cx).is_none());
             assert_eq!(
                 conversation.pending_tool_call_count_for_session(&child_session_id, cx),
                 0
             );
-            assert!(conversation.subagents_awaiting_permission(cx).is_empty());
+            assert!(conversation.inbox_items(cx).is_empty());
         });
         cx.run_until_parked();
     }
 
     #[gpui::test]
-    async fn test_interleaved_permission_requests_preserve_session_buckets(
+    async fn test_interleaved_permission_requests_are_answered_in_arrival_order(
         cx: &mut TestAppContext,
     ) {
         init_test(cx);
@@ -17776,21 +18280,17 @@ pub(crate) mod tests {
         ));
         cx.run_until_parked();
 
-        for expected_tool in ["root-a1", "root-a2", "child-b1"] {
+        for (expected_tool, expected_session) in [
+            ("root-a1", &root_session_id),
+            ("child-b1", &child_session_id),
+            ("root-a2", &root_session_id),
+        ] {
             let (session_id, request_id) = conversation.read_with(cx, |conversation, cx| {
                 let (session_id, request) = conversation
-                    .pending_permission_request(&root_session_id, cx)
-                    .expect("next grouped request");
+                    .focused_permission(cx)
+                    .expect("next request in arrival order");
                 assert_eq!(request.legacy_tool_call_id(), Some(&expected_tool.into()));
-                if expected_tool.starts_with("root") {
-                    assert_eq!(session_id, root_session_id);
-                    assert_eq!(
-                        conversation.pending_tool_call_for_session(&child_session_id, cx),
-                        Some("child-b1".into())
-                    );
-                } else {
-                    assert_eq!(session_id, child_session_id);
-                }
+                assert_eq!(&session_id, expected_session);
                 (session_id, request.id)
             });
             let owner = if session_id == root_session_id {
@@ -17806,24 +18306,13 @@ pub(crate) mod tests {
             cx.run_until_parked();
         }
         conversation.read_with(cx, |conversation, cx| {
-            assert!(
-                conversation
-                    .pending_tool_call(&root_session_id, cx)
-                    .is_none()
-            );
-            assert_eq!(
-                conversation.pending_tool_call_count_for_session(&root_session_id, cx),
-                0
-            );
-            assert_eq!(
-                conversation.pending_tool_call_count_for_session(&child_session_id, cx),
-                0
-            );
+            assert!(conversation.pending_tool_call(cx).is_none());
+            assert!(conversation.inbox_items(cx).is_empty());
         });
     }
 
     #[gpui::test]
-    async fn test_conversation_subagent_scoped_pending_tool_call(cx: &mut TestAppContext) {
+    async fn test_conversation_focuses_the_viewed_subtree(cx: &mut TestAppContext) {
         init_test(cx);
 
         let fs = FakeFs::new(cx.executor());
@@ -17855,28 +18344,49 @@ pub(crate) mod tests {
             request_test_tool_authorization(&parent_thread, "parent-tc", "allow-parent", cx);
         let _subagent_task =
             request_test_tool_authorization(&subagent_thread, "subagent-tc", "allow-subagent", cx);
+        let focused = |cx: &mut TestAppContext| {
+            cx.read(|cx| {
+                let (session_id, tool_call_id, _) = conversation
+                    .read(cx)
+                    .pending_tool_call(cx)
+                    .expect("a focused request");
+                (session_id, tool_call_id)
+            })
+        };
 
-        // Querying with the subagent's session ID returns only the
-        // subagent's own tool call (subagent path is scoped to its session)
+        assert_eq!(
+            focused(cx),
+            (parent_session_id.clone(), "parent-tc".into()),
+            "the first request to arrive is focused"
+        );
+
+        conversation.update(cx, |conversation, cx| {
+            conversation.set_viewer(subagent_session_id.clone(), cx);
+        });
+        assert_eq!(
+            focused(cx),
+            (subagent_session_id.clone(), "subagent-tc".into()),
+            "viewing a subagent focuses its own request"
+        );
         cx.read(|cx| {
-            let (returned_session_id, tool_call_id, _) = conversation
-                .read(cx)
-                .pending_tool_call(&subagent_session_id, cx)
-                .expect("Expected subagent's pending tool call");
-            assert_eq!(returned_session_id, subagent_session_id);
-            assert_eq!(tool_call_id, acp_v2::ToolCallId::new("subagent-tc"));
+            let items = conversation.read(cx).inbox_items(cx);
+            assert_eq!(
+                items
+                    .first()
+                    .map(|item| item.members[0].session_id().clone()),
+                Some(subagent_session_id.clone()),
+                "the viewed subtree is listed first"
+            );
         });
 
-        // Querying with the parent's session ID returns the first pending
-        // request in FIFO order across all sessions
-        cx.read(|cx| {
-            let (returned_session_id, tool_call_id, _) = conversation
-                .read(cx)
-                .pending_tool_call(&parent_session_id, cx)
-                .expect("Expected a pending tool call from parent query");
-            assert_eq!(returned_session_id, parent_session_id);
-            assert_eq!(tool_call_id, acp_v2::ToolCallId::new("parent-tc"));
+        conversation.update(cx, |conversation, cx| {
+            conversation.set_viewer(parent_session_id.clone(), cx);
         });
+        assert_eq!(
+            focused(cx),
+            (subagent_session_id, "subagent-tc".into()),
+            "the parent's subtree already contains the focused request"
+        );
     }
 
     #[gpui::test]
@@ -17955,14 +18465,11 @@ pub(crate) mod tests {
                     Some(tool_id.clone())
                 );
                 let (session_id, pending_tool_id, _) = conversation
-                    .pending_tool_call(&parent_session_id, cx)
+                    .pending_tool_call(cx)
                     .expect("the root should discover the child's pending request");
                 assert_eq!(session_id, subagent_session_id);
                 assert_eq!(pending_tool_id, tool_id);
-                assert_eq!(
-                    conversation.subagents_awaiting_permission(cx),
-                    vec![(subagent_session_id.clone(), pending_count)]
-                );
+                assert_eq!(conversation.inbox_items(cx).len(), pending_count);
             });
             conversation.update(cx, |conversation, cx| {
                 conversation.authorize_tool_call(
@@ -17978,12 +18485,8 @@ pub(crate) mod tests {
             cx.run_until_parked();
         }
         conversation.read_with(cx, |conversation, cx| {
-            assert!(
-                conversation
-                    .pending_tool_call(&parent_session_id, cx)
-                    .is_none()
-            );
-            assert!(conversation.subagents_awaiting_permission(cx).is_empty());
+            assert!(conversation.pending_tool_call(cx).is_none());
+            assert!(conversation.inbox_items(cx).is_empty());
         });
     }
 
@@ -18016,28 +18519,13 @@ pub(crate) mod tests {
         let _task_a = request_test_tool_authorization(&thread_a, "tc-a", "allow-a", cx);
         let _task_b = request_test_tool_authorization(&thread_b, "tc-b", "allow-b", cx);
 
-        // Both threads are non-subagent, so pending_tool_call always returns
-        // the first entry from permission_requests (FIFO across all sessions)
+        // The first request to arrive is focused.
         cx.read(|cx| {
             let (returned_session_id, tool_call_id, _) = conversation
                 .read(cx)
-                .pending_tool_call(&session_id_a, cx)
+                .pending_tool_call(cx)
                 .expect("Expected a pending tool call");
             assert_eq!(returned_session_id, session_id_a);
-            assert_eq!(tool_call_id, acp_v2::ToolCallId::new("tc-a"));
-        });
-
-        // Querying with thread-b also returns thread-a's tool call,
-        // because non-subagent queries always use permission_requests.first()
-        cx.read(|cx| {
-            let (returned_session_id, tool_call_id, _) = conversation
-                .read(cx)
-                .pending_tool_call(&session_id_b, cx)
-                .expect("Expected a pending tool call from thread-b query");
-            assert_eq!(
-                returned_session_id, session_id_a,
-                "Non-subagent queries always return the first pending request in FIFO order"
-            );
             assert_eq!(tool_call_id, acp_v2::ToolCallId::new("tc-a"));
         });
 
@@ -18061,7 +18549,7 @@ pub(crate) mod tests {
         cx.read(|cx| {
             let (returned_session_id, tool_call_id, _) = conversation
                 .read(cx)
-                .pending_tool_call(&session_id_b, cx)
+                .pending_tool_call(cx)
                 .expect("Expected thread-b's tool call after thread-a's was authorized");
             assert_eq!(returned_session_id, session_id_b);
             assert_eq!(tool_call_id, acp_v2::ToolCallId::new("tc-b"));
@@ -18159,8 +18647,8 @@ pub(crate) mod tests {
             request_test_generic_permission(&thread, request.clone(), cx);
         cx.run_until_parked();
         let card = cx
-            .debug_bounds("tool-call-permission-tool-standalone")
-            .expect("existing tool card");
+            .debug_bounds("tool-call-permission-tool-inbox")
+            .expect("the inbox shows the existing tool");
         for request_id in [first_id, second_id] {
             let selector = Box::leak(
                 format!("generic-permission-option-{request_id:?}-custom").into_boxed_str(),
@@ -18168,8 +18656,16 @@ pub(crate) mod tests {
             let control = cx.debug_bounds(selector).expect("attached choice");
             assert!(control.top() >= card.top() && control.bottom() <= card.bottom());
             assert!(control.left() >= card.left() && control.right() <= card.right());
+            let marker = Box::leak(format!("request-marker-{request_id:?}").into_boxed_str());
+            assert!(
+                cx.debug_bounds(marker).is_some(),
+                "the transcript points to the inbox instead of offering choices"
+            );
         }
-        assert!(cx.debug_bounds("standalone-generic-permissions").is_none());
+        assert!(
+            cx.debug_bounds("tool-call-permission-tool-standalone")
+                .is_some()
+        );
         thread.read_with(cx, |thread, _| {
             let (_, tool) = thread.tool_call(&"permission-tool".into()).expect("tool");
             assert!(tool.authorization_id().is_none());
@@ -18215,11 +18711,16 @@ pub(crate) mod tests {
         );
         let (request_id, response) = request_test_generic_permission(&thread, request, cx);
         cx.run_until_parked();
-        assert!(cx.debug_bounds("standalone-generic-permissions").is_some());
+        let card_selector =
+            Box::leak(format!("generic-permission-{request_id:?}").into_boxed_str());
+        assert!(cx.debug_bounds(card_selector).is_some());
         thread.read_with(cx, |thread, _| assert!(thread.entries().is_empty()));
         upsert_permission_test_tool(&thread, "late-permission-tool", cx);
         cx.run_until_parked();
-        assert!(cx.debug_bounds("standalone-generic-permissions").is_none());
+        assert!(
+            cx.debug_bounds("tool-call-late-permission-tool-inbox")
+                .is_some()
+        );
         assert!(
             cx.debug_bounds("tool-call-late-permission-tool-standalone")
                 .is_some()
@@ -18235,14 +18736,14 @@ pub(crate) mod tests {
     }
 
     #[gpui::test]
-    async fn test_generic_tool_permission_floats_only_when_offscreen(cx: &mut TestAppContext) {
+    async fn test_generic_tool_permission_stays_in_inbox_while_scrolling(cx: &mut TestAppContext) {
         init_test(cx);
         let (conversation_view, cx) =
             setup_conversation_view(StubAgentServer::default_response(), cx).await;
         add_to_workspace_with_size(conversation_view.clone(), true, cx);
         let thread_view = active_thread(&conversation_view, cx);
         let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
-        upsert_permission_test_tool(&thread, "floating-permission-tool", cx);
+        upsert_permission_test_tool(&thread, "inbox-permission-tool", cx);
         thread.update(cx, |thread, cx| {
             thread
                 .handle_session_update(
@@ -18256,35 +18757,31 @@ pub(crate) mod tests {
         let request = generic_permission_prompt(
             &thread,
             Some(serde_json::json!({
-                "type": "tool_call", "toolCall": {"toolCallId": "floating-permission-tool"}
+                "type": "tool_call", "toolCall": {"toolCallId": "inbox-permission-tool"}
             })),
             cx,
         );
         let (request_id, response) = request_test_generic_permission(&thread, request, cx);
         cx.run_until_parked();
-        thread_view.update(cx, |view, cx| {
-            view.list_state.scroll_to(ListOffset {
-                item_ix: 0,
-                offset_in_item: px(0.0),
+        for scroll_to_end in [false, true] {
+            thread_view.update(cx, |view, cx| {
+                if scroll_to_end {
+                    view.list_state.scroll_to_end();
+                } else {
+                    view.list_state.scroll_to(ListOffset {
+                        item_ix: 0,
+                        offset_in_item: px(0.0),
+                    });
+                }
+                cx.notify();
             });
-            cx.notify();
-        });
-        cx.run_until_parked();
-        thread_view.update_in(cx, |view, window, cx| {
+            cx.run_until_parked();
             assert!(
-                view.render_main_agent_awaiting_permission(window, cx)
-                    .is_none()
+                cx.debug_bounds("tool-call-inbox-permission-tool-inbox")
+                    .is_some(),
+                "the request stays in the inbox wherever the transcript is scrolled"
             );
-        });
-        thread_view.update(cx, |view, cx| {
-            view.list_state.scroll_to_end();
-            cx.notify();
-        });
-        cx.run_until_parked();
-        assert!(
-            cx.debug_bounds("tool-call-floating-permission-tool-floating")
-                .is_some()
-        );
+        }
         click_generic_permission(request_id, Some("once"), cx);
         assert_eq!(
             response.await,
@@ -18292,12 +18789,7 @@ pub(crate) mod tests {
                 "once"
             ))
         );
-        thread_view.update_in(cx, |view, window, cx| {
-            assert!(
-                view.render_main_agent_awaiting_permission(window, cx)
-                    .is_none()
-            );
-        });
+        assert!(cx.debug_bounds("inbox").is_none());
     }
 
     #[gpui::test]
@@ -18391,12 +18883,7 @@ pub(crate) mod tests {
                 cx.debug_bounds("generic-permission-command-not a command subject")
                     .is_none()
             );
-            thread_view.update_in(cx, |view, window, cx| {
-                assert!(
-                    view.render_main_agent_awaiting_permission(window, cx)
-                        .is_none()
-                );
-            });
+            assert!(cx.debug_bounds("inbox").is_some());
             for option in &request.options {
                 let selector: &'static str = Box::leak(
                     format!(
@@ -18540,13 +19027,24 @@ pub(crate) mod tests {
             Box::leak(format!("generic-permission-option-{first_id:?}-once").into_boxed_str());
         let second_selector: &'static str =
             Box::leak(format!("generic-permission-option-{second_id:?}-once").into_boxed_str());
-        let first = cx
-            .debug_bounds(first_selector)
-            .expect("first same-subject request");
-        let second = cx
-            .debug_bounds(second_selector)
-            .expect("second same-subject request");
-        assert!(first.top() < second.top());
+        assert!(
+            cx.debug_bounds(first_selector).is_some(),
+            "the first same-subject request is shown first"
+        );
+        assert!(cx.debug_bounds(second_selector).is_none());
+        thread_view.update(cx, |view, cx| {
+            view.conversation.update(cx, |conversation, cx| {
+                let item = conversation
+                    .inbox_item_for_request(&UserRequestRef::Permission {
+                        session_id: view.session_id.clone(),
+                        request_id: second_id,
+                    })
+                    .expect("second request is queued separately");
+                conversation.focus_inbox_item(&item, cx);
+            });
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds(second_selector).is_some());
         click_generic_permission(second_id, Some("custom"), cx);
         let acp_v2::RequestPermissionOutcome::Selected(outcome) = second_response.await else {
             panic!("explicit unknown-kind option must return a selection");
@@ -18555,6 +19053,8 @@ pub(crate) mod tests {
         assert!(thread.read_with(cx, |thread, _| {
             thread.permission_request(first_id).is_some()
         }));
+        cx.executor().advance_clock(INBOX_INPUT_GUARD);
+        cx.run_until_parked();
         click_generic_permission(first_id, Some("once"), cx);
         let acp_v2::RequestPermissionOutcome::Selected(outcome) = first_response.await else {
             panic!("explicit known-kind option must return a selection");
@@ -18591,9 +19091,7 @@ pub(crate) mod tests {
     }
 
     #[gpui::test]
-    async fn test_legacy_permission_shortcuts_do_not_skip_generic_requests(
-        cx: &mut TestAppContext,
-    ) {
+    async fn test_permission_shortcuts_answer_focused_requests_in_order(cx: &mut TestAppContext) {
         init_test(cx);
         let (conversation_view, cx) =
             setup_conversation_view(StubAgentServer::default_response(), cx).await;
@@ -18611,9 +19109,18 @@ pub(crate) mod tests {
             request_test_tool_authorization_with_options(&thread, "legacy", options, cx);
         cx.run_until_parked();
         cx.focus(&thread_view);
+        // A generic request at the front is answered, rather than skipped.
         cx.dispatch_action(crate::AllowOnce);
+        // These arrive while the next request is still guarded.
         cx.dispatch_action(crate::AllowAlways);
         cx.dispatch_action(crate::RejectOnce);
+        cx.run_until_parked();
+        assert_eq!(
+            generic_response.await,
+            acp_v2::RequestPermissionOutcome::Selected(acp_v2::SelectedPermissionOutcome::new(
+                "once"
+            ))
+        );
         cx.dispatch_action(crate::SelectPermissionGranularity {
             tool_call_id: "".into(),
             request_id: Some(generic_id),
@@ -18632,13 +19139,10 @@ pub(crate) mod tests {
         });
         cx.run_until_parked();
         thread.read_with(cx, |thread, _| {
-            assert!(thread.permission_request(generic_id).is_some());
             assert!(thread.permission_request(legacy_id).is_some());
         });
-        conversation.read_with(cx, |conversation, _| {
-            assert!(!conversation.permission_selections.contains_key(&generic_id));
-        });
         conversation.read_with(cx, |conversation, cx| {
+            assert!(!conversation.permission_selections.contains_key(&generic_id));
             assert_eq!(
                 conversation.pending_tool_call_count_for_session(&session_id, cx),
                 1
@@ -18647,11 +19151,8 @@ pub(crate) mod tests {
         let legacy_selector: &'static str =
             Box::leak(format!("PERMISSION_BUTTONS-{session_id}-Only this time").into_boxed_str());
         assert!(cx.debug_bounds(legacy_selector).is_some());
-        click_generic_permission(generic_id, None, cx);
-        assert_eq!(
-            generic_response.await,
-            acp_v2::RequestPermissionOutcome::Cancelled
-        );
+        cx.executor().advance_clock(INBOX_INPUT_GUARD);
+        cx.run_until_parked();
         cx.focus(&thread_view);
         cx.dispatch_action(crate::AllowOnce);
         cx.run_until_parked();
@@ -18662,9 +19163,7 @@ pub(crate) mod tests {
     }
 
     #[gpui::test]
-    async fn test_generic_subagent_permissions_are_visible_and_session_scoped(
-        cx: &mut TestAppContext,
-    ) {
+    async fn test_inbox_answers_permissions_from_every_session(cx: &mut TestAppContext) {
         init_test(cx);
         let (conversation_view, cx) =
             setup_conversation_view(StubAgentServer::default_response(), cx).await;
@@ -18695,79 +19194,78 @@ pub(crate) mod tests {
             child_view
         });
         let child = child_view.read_with(cx, |view, _| view.thread.clone());
+        let selector = |prefix: &str, request_id: PermissionRequestId| -> &'static str {
+            Box::leak(format!("{prefix}-{request_id:?}").into_boxed_str())
+        };
+
+        // Identical requests from different agents take a single answer.
         let root_request = generic_permission_prompt(&root, None, cx).description(None);
         let child_request = generic_permission_prompt(&child, None, cx).description(None);
         let (root_id, root_response) = request_test_generic_permission(&root, root_request, cx);
-        let (child_id, child_response) =
-            request_test_generic_permission(&child, child_request.clone(), cx);
+        let (child_id, child_response) = request_test_generic_permission(&child, child_request, cx);
         cx.run_until_parked();
+        conversation.read_with(cx, |conversation, cx| {
+            let items = conversation.inbox_items(cx);
+            assert_eq!(items.len(), 1);
+            assert_eq!(items[0].members.len(), 2);
+        });
         assert!(
-            cx.debug_bounds("generic-permission-source-generic-child")
-                .is_some()
+            cx.debug_bounds(selector("generic-permission-cancel", child_id))
+                .is_none(),
+            "the merged item shows one card"
         );
-        root.read_with(cx, |thread, _| assert!(thread.entries().is_empty()));
-        click_generic_permission(child_id, Some("custom"), cx);
-        let acp_v2::RequestPermissionOutcome::Selected(outcome) = child_response.await else {
-            panic!("root must render functional child controls without a spawning tool anchor");
-        };
-        assert_eq!(outcome.option_id, acp_v2::PermissionOptionId::new("custom"));
-        assert!(root.read_with(cx, |thread, _| thread.permission_request(root_id).is_some()));
+        click_generic_permission(root_id, Some("custom"), cx);
+        for response in [root_response, child_response] {
+            assert_eq!(
+                response.await,
+                acp_v2::RequestPermissionOutcome::Selected(acp_v2::SelectedPermissionOutcome::new(
+                    "custom"
+                ))
+            );
+        }
+        assert!(cx.debug_bounds("inbox").is_none());
 
-        upsert_permission_test_tool(&root, "shared-permission-tool", cx);
-        upsert_permission_test_tool(&child, "shared-permission-tool", cx);
+        // Different requests queue up, and the inbox shows them one at a time.
+        let mut root_request = generic_permission_prompt(&root, None, cx);
+        root_request.title = "Root asks".into();
+        let (root_id, root_response) = request_test_generic_permission(&root, root_request, cx);
+        upsert_permission_test_tool(&child, "child-permission-tool", cx);
         let child_request = generic_permission_prompt(
             &child,
             Some(serde_json::json!({
-                "type": "tool_call", "toolCall": {"toolCallId": "shared-permission-tool"}
+                "type": "tool_call", "toolCall": {"toolCallId": "child-permission-tool"}
             })),
             cx,
-        )
-        .description(None);
-        let (child_id, child_response) = request_test_generic_permission(&child, child_request, cx);
-        root.update(cx, |thread, cx| {
-            let spawn = acp_v1::ToolCall::new("spawn-child", "Running child")
-                .name("spawn_agent")
-                .status(acp_v1::ToolCallStatus::InProgress)
-                .meta(acp_v1::Meta::from_iter([(
-                    acp_thread::SUBAGENT_SESSION_INFO_META_KEY.into(),
-                    serde_json::to_value(acp_thread::SubagentSessionInfo {
-                        session_id: child_session_id.clone(),
-                        message_start_index: 0,
-                        message_end_index: None,
-                    })
-                    .expect("subagent session context"),
-                )]));
-            thread.upsert_tool_call(spawn, cx).expect("spawning tool");
-        });
-        cx.run_until_parked();
-        assert!(
-            cx.debug_bounds("generic-permission-source-generic-child")
-                .is_some()
         );
-        conversation.read_with(cx, |conversation, cx| {
-            assert_eq!(
-                conversation.pending_tool_call_count_for_session(&child_session_id, cx),
-                0
-            );
-            assert!(conversation.subagents_awaiting_permission(cx).is_empty());
-        });
-        conversation_view.update_in(cx, |view, window, cx| {
-            view.navigate_to_thread(child_session_id, window, cx);
-        });
+        let (child_id, child_response) = request_test_generic_permission(&child, child_request, cx);
         cx.run_until_parked();
-        let root_selector: &'static str =
-            Box::leak(format!("generic-permission-cancel-{root_id:?}").into_boxed_str());
-        assert!(cx.debug_bounds(root_selector).is_none());
-        assert!(cx.debug_bounds("standalone-generic-permissions").is_none());
-        let child_card = cx
-            .debug_bounds("tool-call-shared-permission-tool-standalone")
-            .expect("child tool card");
-        let child_selector =
-            Box::leak(format!("generic-permission-cancel-{child_id:?}").into_boxed_str());
-        let child_control = cx.debug_bounds(child_selector).expect("child control");
         assert!(
-            child_control.top() >= child_card.top()
-                && child_control.bottom() <= child_card.bottom()
+            cx.debug_bounds(selector("generic-permission-cancel", root_id))
+                .is_some(),
+            "the first request to arrive is shown"
+        );
+        assert!(
+            cx.debug_bounds(selector("generic-permission-cancel", child_id))
+                .is_none()
+        );
+
+        // Viewing the subagent brings its request forward, answered in the
+        // inbox while its transcript shows a marker.
+        conversation_view.update_in(cx, |view, window, cx| {
+            view.navigate_to_thread(child_session_id.clone(), window, cx);
+        });
+        cx.executor().advance_clock(INBOX_INPUT_GUARD);
+        cx.run_until_parked();
+        let inbox_card = cx
+            .debug_bounds("tool-call-child-permission-tool-inbox")
+            .expect("the subagent's tool in the inbox");
+        let control = cx
+            .debug_bounds(selector("generic-permission-cancel", child_id))
+            .expect("subagent control");
+        assert!(control.top() >= inbox_card.top() && control.bottom() <= inbox_card.bottom());
+        assert!(
+            cx.debug_bounds(selector("request-marker", child_id))
+                .is_some()
         );
         click_generic_permission(child_id, None, cx);
         assert_eq!(
@@ -18775,9 +19273,11 @@ pub(crate) mod tests {
             acp_v2::RequestPermissionOutcome::Cancelled
         );
         assert!(root.read_with(cx, |thread, _| thread.permission_request(root_id).is_some()));
+
         conversation_view.update_in(cx, |view, window, cx| {
             view.navigate_to_thread(root_session_id, window, cx);
         });
+        cx.executor().advance_clock(INBOX_INPUT_GUARD);
         cx.run_until_parked();
         click_generic_permission(root_id, None, cx);
         assert_eq!(
@@ -18838,11 +19338,20 @@ pub(crate) mod tests {
                 });
                 pending
             };
+            let expected_requests = vec![UserRequestRef::Permission {
+                session_id: child_session_id.clone(),
+                request_id,
+            }];
+            let queued_requests = |conversation: &Conversation| {
+                conversation
+                    .requests
+                    .requests()
+                    .filter(|request| request.session_id() == &child_session_id)
+                    .cloned()
+                    .collect::<Vec<_>>()
+            };
             conversation.read_with(cx, |conversation, _| {
-                assert_eq!(
-                    conversation.permission_requests.get(&child_session_id),
-                    Some(&vec![request_id])
-                );
+                assert_eq!(queued_requests(conversation), expected_requests);
             });
             cx.run_until_parked();
             let selector: &'static str =
@@ -18853,8 +19362,8 @@ pub(crate) mod tests {
             );
             conversation.read_with(cx, |conversation, _| {
                 assert_eq!(
-                    conversation.permission_requests.get(&child_session_id),
-                    Some(&vec![request_id]),
+                    queued_requests(conversation),
+                    expected_requests,
                     "queued request events must not duplicate hydrated state"
                 );
             });
@@ -18955,62 +19464,6 @@ pub(crate) mod tests {
         (conversation_view, thread_view, entry_ix, cx)
     }
 
-    struct TestListView {
-        list_state: ListState,
-    }
-
-    impl Render for TestListView {
-        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-            list(self.list_state.clone(), |_, _, _| {
-                div().h(px(20.0)).w_full().into_any_element()
-            })
-            .size_full()
-        }
-    }
-
-    fn draw_thread_list_at(
-        thread_view: &Entity<ThreadView>,
-        scroll_top: ListOffset,
-        cx: &mut VisualTestContext,
-    ) {
-        let list_state = thread_view.read_with(cx, |view, _cx| view.list_state.clone());
-        list_state.scroll_to(scroll_top);
-        cx.draw(
-            point(px(0.0), px(0.0)),
-            size(px(100.0), px(20.0)),
-            |_, cx| {
-                cx.new(|_| TestListView {
-                    list_state: list_state.clone(),
-                })
-                .into_any_element()
-            },
-        );
-    }
-
-    #[gpui::test]
-    async fn test_permission_row_hidden_when_inline_bounds_unavailable(cx: &mut TestAppContext) {
-        init_test(cx);
-
-        let (_view, thread_view, entry_ix, cx) =
-            setup_pending_permission_thread("perm-no-bounds", cx).await;
-
-        // Pin the scroll top to the entry so it isn't treated as above the
-        // viewport, forcing the unmeasured-bounds path we want to exercise.
-        thread_view.read_with(cx, |view, _cx| {
-            view.list_state.scroll_to(ListOffset {
-                item_ix: entry_ix,
-                offset_in_item: px(0.0),
-            });
-        });
-        thread_view.update_in(cx, |view, window, cx| {
-            assert!(
-                view.render_main_agent_awaiting_permission(window, cx)
-                    .is_none(),
-                "Floating row should stay hidden until the inline prompt has known list bounds"
-            );
-        });
-    }
-
     #[gpui::test]
     async fn test_pending_tool_call_for_session_scopes_to_that_session(cx: &mut TestAppContext) {
         init_test(cx);
@@ -19056,306 +19509,364 @@ pub(crate) mod tests {
     }
 
     #[gpui::test]
-    async fn test_permission_row_scroll_to_dismisses_row(cx: &mut TestAppContext) {
+    async fn test_inbox_is_the_only_place_to_answer_permissions(cx: &mut TestAppContext) {
         init_test(cx);
-
-        let (_view, thread_view, entry_ix, cx) =
-            setup_pending_permission_thread("perm-scroll", cx).await;
-
-        // Start off-screen below the viewport. The row is visible because the
-        // item has bounds that do not intersect the viewport.
-        draw_thread_list_at(
-            &thread_view,
-            ListOffset {
-                item_ix: 0,
-                offset_in_item: px(0.0),
-            },
-            cx,
-        );
-        thread_view.read_with(cx, |view, _cx| {
-            assert!(
-                view.list_state.bounds_for_item(entry_ix).is_some(),
-                "The tool call entry must be measured for this test to exercise the\
-                 \"entry below viewport\" branch. If list overdraw stops measuring\
-                 offscreen items, this test needs to drive measurement another way."
-            );
-        });
-        thread_view.update_in(cx, |view, window, cx| {
-            assert!(
-                view.render_main_agent_awaiting_permission(window, cx)
-                    .is_some()
-            );
-        });
-
-        // Simulate clicking "Scroll to": the list scrolls to the entry and the
-        // measured item bounds intersect the viewport.
-        draw_thread_list_at(
-            &thread_view,
-            ListOffset {
-                item_ix: entry_ix,
-                offset_in_item: px(0.0),
-            },
-            cx,
-        );
-
-        thread_view.update_in(cx, |view, window, cx| {
-            assert!(
-                view.render_main_agent_awaiting_permission(window, cx)
-                    .is_none(),
-                "Floating row should disappear after scrolling brings the inline prompt into view"
-            );
-        });
-    }
-
-    #[gpui::test]
-    async fn test_permission_row_does_not_flicker_when_activity_bar_squeezes_list(
-        cx: &mut TestAppContext,
-    ) {
-        init_test(cx);
-
-        let (_view, thread_view, _entry_ix, cx) =
-            setup_pending_permission_thread("perm-flicker", cx).await;
-
-        // Give the pending tool call tall content (like a full plan awaiting
-        // approval), so the floating row embedding it dwarfs the panel.
-        let thread = thread_view.read_with(cx, |view, _cx| view.thread.clone());
-        thread.update(cx, |thread, cx| {
-            thread
-                .handle_session_update(
-                    acp_v1::SessionUpdate::ToolCallUpdate(acp_v1::ToolCallUpdate::new(
-                        acp_v1::ToolCallId::new("perm-flicker"),
-                        acp_v1::ToolCallUpdateFields::new().content(vec![
-                            acp_v1::ToolCallContent::Content(acp_v1::Content::new(
-                                acp_v1::ContentBlock::Text(acp_v1::TextContent::new(
-                                    "Plan step\n\n".repeat(100),
-                                )),
-                            )),
-                        ]),
-                    )),
-                    cx,
-                )
-                .expect("tool call content update should be accepted");
-        });
-        cx.run_until_parked();
-
-        // Park the inline prompt below the viewport so the floating row renders.
-        thread_view.read_with(cx, |view, _cx| {
+        let (conversation_view, thread_view, entry_ix, cx) =
+            setup_pending_permission_thread("inbox-tool", cx).await;
+        thread_view.update(cx, |view, cx| {
             view.list_state.scroll_to(ListOffset {
-                item_ix: 0,
-                offset_in_item: px(0.0),
-            });
-        });
-
-        // Drive several real window draws. Each draw lays out the activity bar
-        // (containing the floating row) and the conversation list together, so
-        // the row's height feeds back into the list viewport height that the
-        // next frame's visibility decision is based on. Since showing the row
-        // squeezes the list to zero height, a decision that treats a
-        // zero-height viewport as "unknown" makes the row's visibility
-        // oscillate from frame to frame, flickering between the conversation
-        // and the permission prompt.
-        let mut row_visibility = Vec::new();
-        for _ in 0..4 {
-            thread_view.update(cx, |_, cx| cx.notify());
-            cx.run_until_parked();
-            thread_view.update_in(cx, |view, window, cx| {
-                row_visibility.push(
-                    view.render_main_agent_awaiting_permission(window, cx)
-                        .is_some(),
-                );
-            });
-        }
-        assert_eq!(
-            row_visibility,
-            vec![true; 4],
-            "Floating row visibility must be stable across frames (false entries mean flicker)"
-        );
-    }
-
-    #[gpui::test]
-    async fn test_permission_row_shown_when_inline_prompt_is_above_viewport(
-        cx: &mut TestAppContext,
-    ) {
-        init_test(cx);
-
-        let (_view, thread_view, entry_ix, cx) =
-            setup_pending_permission_thread("perm-above", cx).await;
-
-        let thread = thread_view.read_with(cx, |view, _cx| view.thread.clone());
-        thread.update(cx, |thread, cx| {
-            let result = thread.handle_session_update(
-                acp_v1::SessionUpdate::AgentMessageChunk(acp_v1::ContentChunk::new(
-                    "More content".into(),
-                )),
-                cx,
-            );
-            assert!(
-                result.is_ok(),
-                "following assistant message should be accepted"
-            );
-        });
-
-        draw_thread_list_at(
-            &thread_view,
-            ListOffset {
-                item_ix: entry_ix + 1,
-                offset_in_item: px(0.0),
-            },
-            cx,
-        );
-        thread_view.read_with(cx, |view, _cx| {
-            assert!(
-                entry_ix < view.list_state.logical_scroll_top().item_ix,
-                "The tool call entry should be above the logical scroll top"
-            );
-        });
-        thread_view.update_in(cx, |view, window, cx| {
-            assert!(
-                view.render_main_agent_awaiting_permission(window, cx)
-                    .is_some(),
-                "Floating row should be visible when the inline prompt is above the viewport"
-            );
-        });
-
-        // Scrolling up to the entry brings it back into view.
-        draw_thread_list_at(
-            &thread_view,
-            ListOffset {
                 item_ix: entry_ix,
                 offset_in_item: px(0.0),
-            },
-            cx,
-        );
-        thread_view.update_in(cx, |view, window, cx| {
-            assert!(
-                view.render_main_agent_awaiting_permission(window, cx)
-                    .is_none(),
-                "Floating row should disappear after scrolling brings the inline prompt into view"
-            );
-        });
-    }
-
-    #[gpui::test]
-    async fn test_permission_row_disappears_when_authorized(cx: &mut TestAppContext) {
-        init_test(cx);
-
-        let (conversation_view, thread_view, _entry_ix, cx) =
-            setup_pending_permission_thread("perm-allow", cx).await;
-
-        // Park the inline prompt below the viewport so the floating row would render.
-        draw_thread_list_at(
-            &thread_view,
-            ListOffset {
-                item_ix: 0,
-                offset_in_item: px(0.0),
-            },
-            cx,
-        );
-        thread_view.update_in(cx, |view, window, cx| {
-            assert!(
-                view.render_main_agent_awaiting_permission(window, cx)
-                    .is_some(),
-                "Floating row should be visible before authorizing"
-            );
-        });
-
-        // Dispatch the same AuthorizeToolCall action the row's Allow button
-        // wires up.
-        conversation_view.update_in(cx, |_, window, cx| {
-            window.dispatch_action(
-                crate::AuthorizeToolCall {
-                    tool_call_id: "perm-allow".to_string(),
-                    request_id: None,
-                    session_id: None,
-                    option_id: "allow".to_string(),
-                    option_kind: "AllowOnce".to_string(),
-                }
-                .boxed_clone(),
-                cx,
-            );
+            });
+            cx.notify();
         });
         cx.run_until_parked();
-
-        conversation_view.read_with(cx, |view, cx| {
-            assert!(
-                view.pending_tool_call(cx).is_none(),
-                "Tool call should no longer be pending after Allow is clicked"
-            );
+        let request_id = thread_view.read_with(cx, |view, cx| {
+            view.thread
+                .read(cx)
+                .permission_request_for_tool(&"inbox-tool".into())
+                .expect("pending request")
+                .id
         });
-        thread_view.update_in(cx, |view, window, cx| {
-            assert!(
-                view.render_main_agent_awaiting_permission(window, cx)
-                    .is_none(),
-                "Floating row should disappear once the permission is granted"
+        let marker: &'static str =
+            Box::leak(format!("request-marker-{request_id:?}").into_boxed_str());
+        assert!(cx.debug_bounds("inbox").is_some());
+        assert!(cx.debug_bounds("tool-call-inbox-tool-inbox").is_some());
+        assert!(cx.debug_bounds("tool-call-inbox-tool-standalone").is_some());
+        assert!(
+            cx.debug_bounds(marker).is_some(),
+            "the transcript points to the inbox"
+        );
+
+        conversation_view.update_in(cx, |_, window, cx| {
+            window.dispatch_action(AllowOnce.boxed_clone(), cx);
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("inbox").is_none());
+        assert!(cx.debug_bounds(marker).is_none());
+        thread_view.read_with(cx, |view, cx| {
+            let thread = view.thread.read(cx);
+            let (_, tool_call) = thread.tool_call(&"inbox-tool".into()).expect("tool call");
+            assert_eq!(
+                tool_call
+                    .permission_decision
+                    .as_ref()
+                    .map(|decision| decision.label.clone()),
+                Some("Allow".into()),
+                "the transcript records the decision"
             );
         });
     }
 
     #[gpui::test]
-    async fn test_permission_row_ignores_subagent_requests(cx: &mut TestAppContext) {
+    async fn test_inbox_cycles_requests_and_guards_input_after_answering(cx: &mut TestAppContext) {
         init_test(cx);
-
-        // Build a baseline ConversationView with no permission requests, so we
-        // have a real `ThreadView` to call `render_main_agent_awaiting_permission` on.
         let (conversation_view, cx) =
             setup_conversation_view(StubAgentServer::default_response(), cx).await;
-        add_to_workspace(conversation_view.clone(), cx);
-
-        let message_editor = message_editor(&conversation_view, cx);
-        message_editor.update_in(cx, |editor, window, cx| {
-            editor.set_text("Hello", window, cx);
-        });
-        active_thread(&conversation_view, cx)
-            .update_in(cx, |view, window, cx| view.send(window, cx));
-        cx.run_until_parked();
-
+        add_to_workspace_with_size(conversation_view.clone(), true, cx);
         let thread_view = active_thread(&conversation_view, cx);
-        let parent_session_id =
-            thread_view.read_with(cx, |view, cx| view.thread.read(cx).session_id().clone());
-        let conversation = thread_view.read_with(cx, |view, _cx| view.conversation.clone());
+        let (thread, conversation) = thread_view.read_with(cx, |view, _| {
+            (view.thread.clone(), view.conversation.clone())
+        });
+        let first = request_test_tool_authorization(&thread, "first", "allow", cx);
+        let second = request_test_tool_authorization(&thread, "second", "allow", cx);
+        let third = request_test_tool_authorization(&thread, "third", "allow", cx);
+        cx.run_until_parked();
+        let focused_tool = |cx: &mut VisualTestContext| {
+            conversation.read_with(cx, |conversation, cx| {
+                conversation
+                    .pending_tool_call(cx)
+                    .map(|(_, tool_call_id, _)| tool_call_id)
+            })
+        };
+        let dispatch = |action: Box<dyn Action>, cx: &mut VisualTestContext| {
+            conversation_view.update_in(cx, |_, window, cx| {
+                window.dispatch_action(action, cx);
+            });
+            cx.run_until_parked();
+        };
 
-        // Attach a subagent thread with a pending tool-call permission request.
+        assert_eq!(focused_tool(cx), Some("first".into()));
+        dispatch(crate::FocusNextRequest.boxed_clone(), cx);
+        assert_eq!(focused_tool(cx), Some("second".into()));
+        dispatch(AllowOnce.boxed_clone(), cx);
+        assert!(matches!(
+            second.await,
+            acp_thread::RequestPermissionOutcome::Selected(_)
+        ));
+        assert_eq!(
+            focused_tool(cx),
+            Some("third".into()),
+            "focus moves to the request after the answered one"
+        );
+
+        dispatch(AllowOnce.boxed_clone(), cx);
+        assert!(
+            thread.read_with(cx, |thread, _| thread
+                .permission_request_for_tool(&"third".into())
+                .is_some()),
+            "a repeated shortcut can't answer the request that just appeared"
+        );
+        cx.executor().advance_clock(INBOX_INPUT_GUARD);
+        cx.run_until_parked();
+        dispatch(AllowOnce.boxed_clone(), cx);
+        assert!(matches!(
+            third.await,
+            acp_thread::RequestPermissionOutcome::Selected(_)
+        ));
+
+        cx.executor().advance_clock(INBOX_INPUT_GUARD);
+        dispatch(crate::FocusPreviousRequest.boxed_clone(), cx);
+        assert_eq!(focused_tool(cx), Some("first".into()));
+        dispatch(AllowOnce.boxed_clone(), cx);
+        assert!(matches!(
+            first.await,
+            acp_thread::RequestPermissionOutcome::Selected(_)
+        ));
+        assert!(cx.debug_bounds("inbox").is_none());
+    }
+
+    #[gpui::test]
+    async fn test_identical_permissions_from_subagents_take_one_answer(cx: &mut TestAppContext) {
+        init_test(cx);
         let fs = FakeFs::new(cx.executor());
         let project = Project::test(fs, [], cx).await;
-        let stub: Rc<dyn AgentConnection> = Rc::new(StubAgentConnection::new());
-        let subagent_thread = cx.update(|_window, cx| {
-            create_test_acp_thread(
-                Some(parent_session_id.clone()),
-                "subagent",
-                stub,
-                project,
-                cx,
-            )
+        let connection: Rc<dyn AgentConnection> = Rc::new(StubAgentConnection::new());
+        let root_session_id = acp_v2::SessionId::new("root");
+        let (children, conversation) = cx.update(|cx| {
+            let root =
+                create_test_acp_thread(None, "root", connection.clone(), project.clone(), cx);
+            let children = ["child-a", "child-b", "child-c"].map(|id| {
+                create_test_acp_thread(
+                    Some(root_session_id.clone()),
+                    id,
+                    connection.clone(),
+                    project.clone(),
+                    cx,
+                )
+            });
+            let conversation = cx.new(|cx| {
+                let mut conversation = Conversation::default();
+                conversation.register_thread(root, cx);
+                for child in &children {
+                    conversation.register_thread(child.clone(), cx);
+                }
+                conversation
+            });
+            (children, conversation)
         });
-        conversation.update(cx, |conversation, cx| {
-            conversation.register_thread(subagent_thread.clone(), cx);
-        });
-        let _subagent_task =
-            request_test_tool_authorization(&subagent_thread, "sub-tc", "allow-sub", cx);
+        let options = ToolPermissionContext::new(TerminalTool::NAME, vec!["cargo test".into()])
+            .build_permission_options();
+        let mut responses = Vec::new();
+        for (child, command) in children
+            .iter()
+            .zip(["cargo test", "cargo test", "cargo build"])
+        {
+            let (_, response) = cx.update(|cx| {
+                child.update(cx, |thread, cx| {
+                    thread
+                        .request_tool_call_authorization_with_id(
+                            acp_v1::ToolCall::new("run", format!("Run {command}"))
+                                .kind(acp_v1::ToolKind::Execute)
+                                .raw_input(serde_json::json!({ "command": command }))
+                                .into(),
+                            options.clone(),
+                            acp_thread::AuthorizationKind::PermissionGrant,
+                            cx,
+                        )
+                        .expect("permission request should succeed")
+                })
+            });
+            responses.push(response);
+        }
         cx.run_until_parked();
+        conversation.read_with(cx, |conversation, cx| {
+            let items = conversation.inbox_items(cx);
+            assert_eq!(
+                items
+                    .iter()
+                    .map(|item| item.members.len())
+                    .collect::<Vec<_>>(),
+                vec![2, 1],
+                "the two identical requests share an item"
+            );
+        });
 
-        cx.read(|cx| {
+        conversation.update(cx, |conversation, cx| {
+            conversation.authorize_focused_permission(acp_v2::PermissionOptionKind::AllowOnce, cx);
+        });
+        cx.run_until_parked();
+        let different = responses.pop().expect("third response");
+        for response in responses {
+            assert!(matches!(
+                response.await,
+                acp_thread::RequestPermissionOutcome::Selected(_)
+            ));
+        }
+        conversation.read_with(cx, |conversation, cx| {
+            assert_eq!(conversation.inbox_items(cx).len(), 1);
+        });
+        drop(different);
+    }
+
+    #[gpui::test]
+    async fn test_questions_are_answered_in_the_inbox(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::default_response(), cx).await;
+        add_to_workspace_with_size(conversation_view.clone(), true, cx);
+        let thread_view = active_thread(&conversation_view, cx);
+        let (thread, conversation) = thread_view.read_with(cx, |view, _| {
+            (view.thread.clone(), view.conversation.clone())
+        });
+        let session_id = thread.read_with(cx, |thread, _| thread.session_id().clone());
+        let response = thread.update(cx, |thread, cx| {
+            thread
+                .request_elicitation(
+                    acp_v2::CreateElicitationRequest::new(
+                        acp_v2::ElicitationFormMode::new(
+                            acp_v2::ElicitationSessionScope::new(session_id.clone()),
+                            acp_v2::ElicitationSchema::new().string("name", false),
+                        ),
+                        "Pick a name",
+                    ),
+                    cx,
+                )
+                .expect("elicitation request")
+        });
+        cx.run_until_parked();
+        let elicitation_id = thread.read_with(cx, |thread, _| {
+            thread
+                .entries()
+                .iter()
+                .find_map(|entry| match entry {
+                    AgentThreadEntry::Elicitation(id) => Some(id.clone()),
+                    _ => None,
+                })
+                .expect("elicitation entry")
+        });
+        let marker: &'static str =
+            Box::leak(format!("request-marker-{}", elicitation_id.0).into_boxed_str());
+        assert!(cx.debug_bounds("inbox").is_some());
+        assert!(cx.debug_bounds(marker).is_some());
+
+        conversation.update(cx, |conversation, cx| {
+            conversation.submit_elicitation(session_id.clone(), elicitation_id.clone(), cx);
+        });
+        cx.run_until_parked();
+        assert!(matches!(
+            response.await.action,
+            acp_v2::ElicitationAction::Accept(_)
+        ));
+        assert!(cx.debug_bounds("inbox").is_none());
+        assert!(cx.debug_bounds(marker).is_none());
+        conversation.read_with(cx, |conversation, _| {
             assert!(
                 conversation
-                    .read(cx)
-                    .pending_tool_call_for_session(&parent_session_id, cx)
+                    .elicitation_draft(&session_id, &elicitation_id)
                     .is_none(),
-                "Subagent requests must not surface as pending in the parent session"
-            );
-            assert!(
-                !conversation
-                    .read(cx)
-                    .subagents_awaiting_permission(cx)
-                    .is_empty(),
-                "Subagent permission row should still see the pending request"
+                "answered questions drop their drafts"
             );
         });
+    }
 
-        thread_view.update_in(cx, |view, window, cx| {
-            assert!(
-                view.render_main_agent_awaiting_permission(window, cx)
-                    .is_none(),
-                "Subagent permission requests should not trigger the main-agent floating row"
+    #[gpui::test]
+    async fn test_question_drafts_survive_switching_requests(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::default_response(), cx).await;
+        add_to_workspace_with_size(conversation_view.clone(), true, cx);
+        let thread_view = active_thread(&conversation_view, cx);
+        let (thread, conversation) = thread_view.read_with(cx, |view, _| {
+            (view.thread.clone(), view.conversation.clone())
+        });
+        let session_id = thread.read_with(cx, |thread, _| thread.session_id().clone());
+        let response = thread.update(cx, |thread, cx| {
+            thread
+                .request_elicitation(
+                    acp_v2::CreateElicitationRequest::new(
+                        acp_v2::ElicitationFormMode::new(
+                            acp_v2::ElicitationSessionScope::new(session_id.clone()),
+                            acp_v2::ElicitationSchema::new().boolean("flag", false),
+                        ),
+                        "Enable it?",
+                    ),
+                    cx,
+                )
+                .expect("elicitation request")
+        });
+        let _permission = request_test_tool_authorization(&thread, "other", "allow", cx);
+        cx.run_until_parked();
+        let elicitation_id = thread.read_with(cx, |thread, _| {
+            thread
+                .entries()
+                .iter()
+                .find_map(|entry| match entry {
+                    AgentThreadEntry::Elicitation(id) => Some(id.clone()),
+                    _ => None,
+                })
+                .expect("elicitation entry")
+        });
+
+        conversation.update(cx, |conversation, cx| {
+            conversation.update_elicitation_draft(
+                &session_id,
+                &elicitation_id,
+                |draft| draft.set_boolean("flag", true),
+                cx,
+            );
+            conversation.cycle_inbox_focus(1, cx);
+            conversation.cycle_inbox_focus(1, cx);
+            conversation.submit_elicitation(session_id.clone(), elicitation_id.clone(), cx);
+        });
+        cx.run_until_parked();
+        let acp_v2::ElicitationAction::Accept(accepted) = response.await.action else {
+            panic!("the question should be answered");
+        };
+        assert_eq!(
+            accepted
+                .content
+                .and_then(|content| content.get("flag").cloned()),
+            Some(acp_v2::ElicitationContentValue::Boolean(true)),
+            "the draft answer is kept while focus moves between requests"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_viewing_a_notification_focuses_its_request(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::default_response(), cx).await;
+        let thread_view = active_thread(&conversation_view, cx);
+        let (thread, conversation) = thread_view.read_with(cx, |view, _| {
+            (view.thread.clone(), view.conversation.clone())
+        });
+        let session_id = thread.read_with(cx, |thread, _| thread.session_id().clone());
+        let _first = request_test_tool_authorization(&thread, "first", "allow", cx);
+        let (second_id, _second) = request_test_tool_authorization_with_options(
+            &thread,
+            "second",
+            PermissionOptions::Flat(vec![acp_v2::PermissionOption::new(
+                "allow",
+                "Allow",
+                acp_v2::PermissionOptionKind::AllowOnce,
+            )]),
+            cx,
+        );
+        cx.run_until_parked();
+        conversation_view.update(cx, |view, cx| {
+            view.notified_request = Some(UserRequestRef::Permission {
+                session_id,
+                request_id: second_id,
+            });
+            view.focus_notified_request(cx);
+        });
+        conversation.read_with(cx, |conversation, cx| {
+            assert_eq!(
+                conversation
+                    .pending_tool_call(cx)
+                    .map(|(_, tool_call_id, _)| tool_call_id),
+                Some("second".into())
             );
         });
     }

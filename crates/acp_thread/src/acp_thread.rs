@@ -1120,12 +1120,29 @@ pub struct ToolCall {
     /// A subagent link established by the client rather than carried in `meta`,
     /// kept separately so that later protocol metadata patches don't erase it.
     client_subagent_link: Option<SubagentSessionInfo>,
+    /// The option the user chose when the tool call asked for permission.
+    pub permission_decision: Option<PermissionDecision>,
     pub sandbox_authorization_details: Option<SandboxAuthorizationDetails>,
     pub sandbox_fallback_authorization_details: Option<SandboxFallbackAuthorizationDetails>,
     /// Why this terminal command ran without the OS sandbox even though
     /// sandboxing was active (see [`SANDBOX_NOT_APPLIED_META_KEY`]). `None` when
     /// the command was sandboxed normally (or sandboxing was off).
     pub sandbox_not_applied: Option<SandboxNotAppliedReason>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct PermissionDecision {
+    pub label: SharedString,
+    pub kind: acp_v2::PermissionOptionKind,
+}
+
+impl PermissionDecision {
+    fn new(option: &acp_v2::PermissionOption) -> Self {
+        Self {
+            label: option.name.clone().into(),
+            kind: option.kind.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -1402,6 +1419,7 @@ impl ToolCall {
             tool_name,
             subagent_session_info,
             client_subagent_link: None,
+            permission_decision: None,
             sandbox_authorization_details,
             sandbox_fallback_authorization_details,
             sandbox_not_applied,
@@ -6123,14 +6141,21 @@ impl AcpThread {
         else {
             return;
         };
-        if !request
+        let Some(decision) = request
             .options
             .iter()
-            .any(|option| option.option_id == option_id)
-        {
+            .find(|option| option.option_id == option_id)
+            .map(PermissionDecision::new)
+        else {
             log::debug!("Permission choice is not an offered option");
             return;
-        }
+        };
+        let tool_call_id = match request.subject.as_ref() {
+            Some(acp_v2::RequestPermissionSubject::ToolCall(subject)) => {
+                Some(subject.tool_call.tool_call_id.clone())
+            }
+            _ => None,
+        };
         let Some(PermissionRequest {
             data: PermissionRequestData::Generic { respond_tx, .. },
             ..
@@ -6138,6 +6163,12 @@ impl AcpThread {
         else {
             return;
         };
+        if let Some(tool_call_id) = tool_call_id
+            && let Some((index, call)) = self.tool_call_mut(&tool_call_id)
+        {
+            call.permission_decision = Some(decision);
+            cx.emit(AcpThreadEvent::EntryUpdated(index));
+        }
         if respond_tx
             .send(acp_v2::RequestPermissionOutcome::Selected(
                 acp_v2::SelectedPermissionOutcome::new(option_id),
@@ -6329,6 +6360,7 @@ impl AcpThread {
             return;
         };
         outcome.option_kind = option.kind.clone();
+        let decision = PermissionDecision::new(option);
         let tool_call_id = tool_call_id.clone();
         let kind = *kind;
         let Some((_, call)) = self.tool_call_mut(&tool_call_id) else {
@@ -6359,6 +6391,7 @@ impl AcpThread {
             }
         };
         call.set_local_status(new_status);
+        call.permission_decision = Some(decision);
         self.resolve_permission_request(id, RequestPermissionOutcome::Selected(outcome), cx);
     }
 

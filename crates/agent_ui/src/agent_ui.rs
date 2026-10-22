@@ -352,6 +352,10 @@ actions!(
         AllowAlways,
         /// Reject this operation only this time.
         RejectOnce,
+        /// Shows the next request waiting for your input.
+        FocusNextRequest,
+        /// Shows the previous request waiting for your input.
+        FocusPreviousRequest,
         /// Follows the agent's suggestions.
         Follow,
         /// Resets the trial upsell notification.

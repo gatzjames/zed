@@ -8146,9 +8146,7 @@ fn all_thread_infos_for_workspace(
         .conversation_views()
         .into_iter()
         .filter_map(|conversation_view| {
-            let has_pending_tool_call = conversation_view
-                .read(cx)
-                .root_thread_has_pending_tool_call(cx);
+            let has_pending_tool_call = conversation_view.read(cx).has_pending_user_request(cx);
             let conversation_thread_id = conversation_view.read(cx).parent_id();
             let thread_view = conversation_view.read(cx).root_thread_view()?;
             let thread_view_ref = thread_view.read(cx);
@@ -8390,9 +8388,7 @@ fn dump_single_workspace(workspace: &Workspace, output: &mut String, cx: &gpui::
             if panel
                 .active_conversation_view()
                 .is_some_and(|conversation_view| {
-                    conversation_view
-                        .read(cx)
-                        .root_thread_has_pending_tool_call(cx)
+                    conversation_view.read(cx).has_pending_user_request(cx)
                 })
             {
                 write!(output, ", awaiting confirmation").ok();
@@ -8422,10 +8418,7 @@ fn dump_single_workspace(workspace: &Workspace, output: &mut String, cx: &gpui::
                     let entry_count = thread.entries().len();
                     write!(output, "  - {title} (thread: {session_id:?})").ok();
                     write!(output, " [{status}, {entry_count} entries").ok();
-                    if conversation_view
-                        .read(cx)
-                        .root_thread_has_pending_tool_call(cx)
-                    {
+                    if conversation_view.read(cx).has_pending_user_request(cx) {
                         write!(output, ", awaiting confirmation").ok();
                     }
                     writeln!(output, "]").ok();
